@@ -2726,6 +2726,10 @@ class RayCLPOTrainer(RayPPOTrainer):
                             config=self.config.algorithm,
                         )
 
+                    # Ensure global_token_num is correctly set for the concatenated mixed batch
+                    if "attention_mask" in mixed.batch:
+                        mixed.meta_info["global_token_num"] = torch.sum(mixed.batch["attention_mask"], dim=-1).tolist()
+
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(mixed)
