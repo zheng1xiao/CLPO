@@ -1,0 +1,61 @@
+# Byte-compiled / cache
+*.py[cod]
+*.pyc
+__pycache__/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.env
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+*.egg
+.eggs/
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+
+# Test / coverage
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+htmlcov/
+.coverage
+
+# C extensions / compiled
+*.so
+*.pyd
+*.dll
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+*.whl
+pip-log.txt
+
+# Outputs from scripts / bash
+output/
+outputs/
+*.out
+
+# Misc
+node_modules/

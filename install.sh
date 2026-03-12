@@ -33,6 +33,6 @@ wget -nv https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.2.po
 
 pip install "click<8.1.4" "ray==2.45.0"
 
-pip install uvloop==0.21.0
+pip install uvloop==0.21.0 swanlab
 
 echo "Successfully installed all packages"
