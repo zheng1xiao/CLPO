@@ -259,7 +259,7 @@ def classify_samples_by_difficulty(data: DataProto, hard_acc_upper: float = 0.3,
         acc = uid2acc[u]
         if acc <= hard_acc_upper:
             difficulty_labels.append("hard")
-        elif med_acc_lower < acc <= med_acc_upper:
+        elif hard_acc_upper < acc < med_acc_upper:
             difficulty_labels.append("medium")
         else:
             difficulty_labels.append("easy")
@@ -351,20 +351,21 @@ def compute_advantage(
             uid2reward = {}
             for i, u in enumerate(uid):
                 uid2reward.setdefault(u, []).append(float(seq_rewards[i]))
-            uid2reward_mean = {u: float(np.mean(v)) for u, v in uid2reward.items()}
+            uid2reward_mean = {u: round(float(np.mean(v)), 3) for u, v in uid2reward.items()}
             
-            # Get thresholds from config
-            hard_reward_upper = config.get("hard_reward_upper", 0.3)  # Reward threshold for hard samples
-            med_reward_lower = config.get("med_reward_lower", 0.3)
-            med_reward_upper = config.get("med_reward_upper", 0.7)
+            # Use the provided num_repeat (n_rollouts) as G
+            G = num_repeat
+            k = (G - 1) // 3
+            dynamic_tau_hard = round(k / G, 3)
+            dynamic_tau_easy = round((G - k) / G, 3)
             
             # Classify samples by difficulty
             difficulty_labels = []
             for i, u in enumerate(uid):
                 reward_mean = uid2reward_mean[u]
-                if reward_mean <= hard_reward_upper:
+                if reward_mean <= dynamic_tau_hard:
                     difficulty_labels.append("hard")
-                elif med_reward_lower < reward_mean <= med_reward_upper:
+                elif dynamic_tau_hard < reward_mean < dynamic_tau_easy:
                     difficulty_labels.append("medium")
                 else:
                     difficulty_labels.append("easy")
@@ -1337,12 +1338,14 @@ class RayPPOTrainer:
 
                         # Classify samples by difficulty based on reward/accuracy
                         if self.config.algorithm.get("enable_difficulty_classification", False):
-                            hard_acc_upper = self.config.algorithm.get("hard_acc_upper", 0.3)
-                            med_acc_lower = self.config.algorithm.get("med_acc_lower", 0.3) 
-                            med_acc_upper = self.config.algorithm.get("med_acc_upper", 0.7)
+                            G = self.config.actor_rollout_ref.rollout.n
+                            k = (G - 1) // 3
+                            dynamic_tau_hard = round(k / G, 3)
+                            dynamic_tau_easy = round((G - k) / G, 3)
+                            
                             batch = classify_samples_by_difficulty(
-                                batch, hard_acc_upper=hard_acc_upper, 
-                                med_acc_lower=med_acc_lower, med_acc_upper=med_acc_upper
+                                batch, hard_acc_upper=dynamic_tau_hard, 
+                                med_acc_lower=dynamic_tau_hard, med_acc_upper=dynamic_tau_easy
                             )
                             
                             # Add KL scaling based on difficulty classification
@@ -1554,17 +1557,18 @@ class RayPPOTrainer:
             uid2acc = {}
             for i, u in enumerate(uid):
                 uid2acc.setdefault(u, []).append(float(acc_arr[i]))
-            uid2acc = {u: float(np.mean(v)) for u, v in uid2acc.items()}
-
-            # Define difficulty thresholds (using CLPO defaults if available, otherwise reasonable defaults)
-            hard_threshold = getattr(self, 'clpo_hard_acc_upper', 0.3)
-            med_lower = getattr(self, 'clpo_med_acc_lower', 0.3)
-            med_upper = getattr(self, 'clpo_med_acc_upper', 0.7)
-
+            uid2acc = {u: round(float(np.mean(v)), 3) for u, v in uid2acc.items()}
+            
+            # Get G (n_rollouts) to calculate dynamic thresholds
+            G = self.config.actor_rollout_ref.rollout.n
+            k = (G - 1) // 3
+            dynamic_tau_hard = round(k / G, 3)
+            dynamic_tau_easy = round((G - k) / G, 3)
+            
             # Classify by difficulty
-            hard_uids = [u for u, a in uid2acc.items() if a <= hard_threshold]
-            med_uids = [u for u, a in uid2acc.items() if med_lower < a <= med_upper]
-            easy_uids = [u for u, a in uid2acc.items() if a > med_upper]
+            hard_uids = [u for u, a in uid2acc.items() if a <= dynamic_tau_hard]
+            med_uids = [u for u, a in uid2acc.items() if dynamic_tau_hard < a < dynamic_tau_easy]
+            easy_uids = [u for u, a in uid2acc.items() if a >= dynamic_tau_easy]
 
             # Calculate ratios
             total_samples = len(batch)
@@ -1614,12 +1618,16 @@ class RayCLPOTrainer(RayPPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # CLPO thresholds from config
+        # CLPO dynamic thresholds
         data_cfg = getattr(self.config, "data", {})
-        self.clpo_hard_acc_upper = float(getattr(data_cfg, "clpo_hard_acc_upper", 0.3))
-        self.clpo_med_acc_lower = float(getattr(data_cfg, "clpo_medium_acc_lower", 0.3))
-        self.clpo_med_acc_upper = float(getattr(data_cfg, "clpo_medium_acc_upper", 0.7))
         self.max_prompt_length = int(getattr(data_cfg, "max_prompt_length", 2048))
+        
+        # Calculate dynamic thresholds based on n_rollouts (G)
+        # We assume n_rollouts is accessible via config
+        G = self.config.actor_rollout_ref.rollout.n
+        k = (G - 1) // 3
+        self.dynamic_tau_hard = round(k / G, 3)
+        self.dynamic_tau_easy = round((G - k) / G, 3)
         
         # CLPO rewrite data saving configuration
         self.clpo_save_rewrite_data = getattr(data_cfg, "clpo_save_rewrite_data", False)
@@ -2142,10 +2150,10 @@ class RayCLPOTrainer(RayPPOTrainer):
                     uid2acc = {}
                     for i, u in enumerate(uid):
                         uid2acc.setdefault(u, []).append(float(acc_arr[i]))
-                    uid2acc = {u: float(np.mean(v)) for u, v in uid2acc.items()}
+                    uid2acc = {u: round(float(np.mean(v)), 3) for u, v in uid2acc.items()}
 
-                    hard_uids = [u for u, a in uid2acc.items() if a <= self.clpo_hard_acc_upper]
-                    med_uids = [u for u, a in uid2acc.items() if self.clpo_med_acc_lower < a <= self.clpo_med_acc_upper]
+                    hard_uids = [u for u, a in uid2acc.items() if a <= self.dynamic_tau_hard]
+                    med_uids = [u for u, a in uid2acc.items() if self.dynamic_tau_hard < a < self.dynamic_tau_easy]
                     oqa_train_uids = [u for u, a in uid2acc.items() if 0.0 < a < 1.0]
 
                     def uids_to_indices(uids: list[str]) -> list[int]:
@@ -2164,7 +2172,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                     uid2acc = {}
                     for i, u in enumerate(uid):
                         uid2acc.setdefault(u, []).append(float(acc_arr[i]))
-                    uid2acc = {u: float(np.mean(v)) for u, v in uid2acc.items()}
+                    uid2acc = {u: round(float(np.mean(v)), 3) for u, v in uid2acc.items()}
 
                     easy_problem_count = 0
                     medium_problem_count = 0
@@ -2178,11 +2186,11 @@ class RayCLPOTrainer(RayPPOTrainer):
                             fully_correct_problem_count += 1
                         elif acc == 0.0:
                             fully_wrong_problem_count += 1
-                        elif 0.0 < acc <= self.clpo_hard_acc_upper:
+                        elif 0.0 < acc <= self.dynamic_tau_hard:
                             hard_problem_count += 1
-                        elif self.clpo_med_acc_lower < acc <= self.clpo_med_acc_upper:
+                        elif self.dynamic_tau_hard < acc < self.dynamic_tau_easy:
                             medium_problem_count += 1
-                        elif self.clpo_med_acc_upper < acc < 1.0:
+                        elif self.dynamic_tau_easy <= acc < 1.0:
                             easy_problem_count += 1
                     
                     metrics["clpo/oqa_batch/total_problem_count"] = total_problem_count
@@ -2194,8 +2202,8 @@ class RayCLPOTrainer(RayPPOTrainer):
                     def collect_prompts(dp: DataProto, idxs: list[int]) -> list[str]:
                         return [self._decode_prompt_text(dp, i) for i in idxs]
 
-                    hard_problem_uids = [u for u, a in uid2acc.items() if a <= self.clpo_hard_acc_upper]
-                    medium_problem_uids = [u for u, a in uid2acc.items() if self.clpo_med_acc_lower < a <= self.clpo_med_acc_upper]
+                    hard_problem_uids = [u for u, a in uid2acc.items() if a <= self.dynamic_tau_hard]
+                    medium_problem_uids = [u for u, a in uid2acc.items() if self.dynamic_tau_hard < a < self.dynamic_tau_easy]
                     
                     should_rewrite_hard = self.clpo_rewrite_mode in ["hard_only", "both"]
                     should_rewrite_medium = self.clpo_rewrite_mode in ["medium_only", "both"]
@@ -2440,8 +2448,8 @@ class RayCLPOTrainer(RayPPOTrainer):
                         source = src[i]
                         original_acc = uid2acc.get(uid_final, -1)  
                         
-                        is_orig_medium = (self.clpo_med_acc_lower < original_acc <= self.clpo_med_acc_upper)
-                        is_orig_hard = (0.0 <= original_acc <= self.clpo_hard_acc_upper)
+                        is_orig_medium = (self.dynamic_tau_hard < original_acc < self.dynamic_tau_easy)
+                        is_orig_hard = (0.0 <= original_acc <= self.dynamic_tau_hard)
                         
                         if source == "oqa":
                             if is_orig_medium:
@@ -2532,9 +2540,9 @@ class RayCLPOTrainer(RayPPOTrainer):
                     
                     for uid in unique_problems_in_final_batch:
                         original_acc = uid2acc.get(uid, -1)
-                        if 0.0 <= original_acc <= self.clpo_hard_acc_upper:
+                        if 0.0 <= original_acc <= self.dynamic_tau_hard:
                             hard_problems_in_final_batch_count += 1
-                        elif self.clpo_med_acc_lower < original_acc <= self.clpo_med_acc_upper:
+                        elif self.dynamic_tau_hard < original_acc < self.dynamic_tau_easy:
                             medium_problems_in_final_batch_count += 1
                     
                     
@@ -2584,7 +2592,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                     else:
                         print(f"[CLPO] Hard rewrite disabled - no rescue analysis")
 
-                    easy_uids = [u for u, a in uid2acc.items() if a > self.clpo_med_acc_upper]
+                    easy_uids = [u for u, a in uid2acc.items() if a >= self.dynamic_tau_easy]
                     ori_hard = len([u for u in uid if u in hard_uids])
                     ori_med = len([u for u in uid if u in med_uids])
                     ori_easy = len([u for u in uid if u in easy_uids])
@@ -2672,9 +2680,9 @@ class RayCLPOTrainer(RayPPOTrainer):
                                     # Further classify OQA samples by accuracy
                                     u = uid[i]
                                     acc = uid2acc.get(u, 0.5)  # Default to medium if not found
-                                    if acc <= self.clpo_hard_acc_upper:
+                                    if acc <= self.dynamic_tau_hard:
                                         difficulty_labels.append("hard")
-                                    elif self.clpo_med_acc_lower < acc <= self.clpo_med_acc_upper:
+                                    elif self.dynamic_tau_hard < acc < self.dynamic_tau_easy:
                                         difficulty_labels.append("medium")
                                     else:
                                         difficulty_labels.append("easy")
