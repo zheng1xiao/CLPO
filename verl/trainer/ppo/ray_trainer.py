@@ -1959,9 +1959,7 @@ class RayCLPOTrainer(RayPPOTrainer):
         mapped_original_idxs = [original_idxs[i] for i in valid_indices]
         
         for key, value in original_batch.non_tensor_batch.items():
-            if key == "uid":
-                continue
-                
+            # [KFG FIX] We MUST preserve the original UID for KFG calculation
             if isinstance(value, dict):
                 rewritten_dict = {}
                 for subkey, subvalue in value.items():
@@ -1986,9 +1984,12 @@ class RayCLPOTrainer(RayPPOTrainer):
         if rewritten_batch is None or len(rewritten_batch) == 0:
             return None
             
-        rewritten_batch.non_tensor_batch["uid"] = np.array(
-            [str(uuid.uuid4()) for _ in range(len(rewritten_batch))], dtype=object
-        )
+        # [KFG FIX] Do not reassign UID here. KFG requires UID mapping from original questions.
+        # Check if uid exists, if not create new ones (fallback)
+        if "uid" not in rewritten_batch.non_tensor_batch or rewritten_batch.non_tensor_batch["uid"] is None:
+            rewritten_batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(rewritten_batch))], dtype=object
+            )
         
         gen_batch = self._get_gen_batch(rewritten_batch)
         gen_batch.meta_info["global_steps"] = self.global_steps
@@ -2664,10 +2665,21 @@ class RayCLPOTrainer(RayPPOTrainer):
                                 seq_rewards = mixed.batch["token_level_scores"].sum(dim=-1).cpu().numpy()
                                 acc_arr = (seq_rewards > 0).astype(float)
 
-                            uid2acc = {}
+                            # Create separate dictionaries for OQA (original) and Rewritten accuracies in the mixed batch
+                            mixed_oqa_uid2acc = {}
+                            mixed_rewritten_uid2acc = {}
+                            
                             for i, u in enumerate(uid):
-                                uid2acc.setdefault(u, []).append(float(acc_arr[i]))
-                            uid2acc = {u: float(np.mean(v)) for u, v in uid2acc.items()}
+                                source = str(src[i])
+                                acc_val = float(acc_arr[i])
+                                if source == "oqa":
+                                    mixed_oqa_uid2acc.setdefault(u, []).append(acc_val)
+                                else: # rewritten_hard or rewritten_medium
+                                    mixed_rewritten_uid2acc.setdefault(u, []).append(acc_val)
+                                    
+                            # Average them out
+                            mixed_oqa_uid2acc = {u: float(np.mean(v)) for u, v in mixed_oqa_uid2acc.items()}
+                            mixed_rewritten_uid2acc = {u: float(np.mean(v)) for u, v in mixed_rewritten_uid2acc.items()}
                             
                             # Create difficulty labels based on both source and accuracy
                             difficulty_labels = []
@@ -2679,7 +2691,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                                 elif str(s) == "oqa":
                                     # Further classify OQA samples by accuracy
                                     u = uid[i]
-                                    acc = uid2acc.get(u, 0.5)  # Default to medium if not found
+                                    acc = uid2acc.get(u, 0.5)  # Use original uid2acc for difficulty labels
                                     if acc <= self.dynamic_tau_hard:
                                         difficulty_labels.append("hard")
                                     elif self.dynamic_tau_hard < acc < self.dynamic_tau_easy:
@@ -2692,21 +2704,41 @@ class RayCLPOTrainer(RayPPOTrainer):
                             # Set difficulty_source for KL metrics recording
                             mixed.non_tensor_batch["difficulty_source"] = np.array(difficulty_labels, dtype=object)
                             
-                            # In-reward multipliers based on fine-grained difficulty
-                            r_hard = float(self.config.algorithm.get("kl_in_reward_coef_hard", 1.0))
-                            r_non = float(self.config.algorithm.get("kl_in_reward_coef_nonhard", 1.0))
-                            r_scale = np.array([
-                                r_hard if str(d) == "hard" else r_non for d in difficulty_labels
-                            ], dtype=float)
+                            # --- [KFG] KFG Dynamic Lambda Mechanism ---
+                            gamma_val = float(self.config.actor_rollout_ref.actor.get("kfg_gamma", 1.0))
+                            
+                            delta_acc_list = []
+                            for i, u in enumerate(uid):
+                                source = str(src[i])
+                                if source == "oqa":
+                                    # 原始样本保留严格的KL散度惩罚 (即 delta_acc = 0 -> lambda = 1.0)
+                                    delta_acc_list.append(0.0)
+                                else:
+                                    # 重写样本才计算增益: Acc_Rewritten - Acc_Original
+                                    acc_orig = uid2acc.get(u, 0.0)
+                                    acc_rew = mixed_rewritten_uid2acc.get(u, acc_orig)
+                                    delta_acc_list.append(float(acc_rew - acc_orig))
+
+                            delta_acc = torch.tensor(delta_acc_list, dtype=torch.float32)
+                            
+                            # Ensure lambda is 1.0 when Delta Acc <= 0 (no gain or loss -> strict KL)
+                            # i.e. we only decay lambda if there is improvement (delta_acc > 0)
+                            positive_delta = torch.maximum(delta_acc, torch.zeros_like(delta_acc))
+                            
+                            # Calculate dynamic lambda: exp(-gamma * max(0, delta_acc))
+                            dynamic_lambda = torch.exp(-gamma_val * positive_delta)
+                            
+                            # Apply KFG dynamic lambda to in-reward multipliers
+                            r_scale = dynamic_lambda.cpu().numpy().astype(float)
                             mixed.non_tensor_batch["kl_in_reward_scale"] = r_scale
 
-                            # In-loss multipliers based on fine-grained difficulty
-                            l_hard = float(self.config.actor_rollout_ref.actor.get("kl_loss_coef_hard_scale", 1.0))
-                            l_non = float(self.config.actor_rollout_ref.actor.get("kl_loss_coef_nonhard_scale", 1.0))
-                            l_scale = torch.tensor([
-                                l_hard if str(d) == "hard" else l_non for d in difficulty_labels
-                            ], dtype=mixed.batch["token_level_scores"].dtype, device=mixed.batch["token_level_scores"].device)
+                            # Apply KFG dynamic lambda to in-loss multipliers
+                            l_scale = dynamic_lambda.to(
+                                dtype=mixed.batch["token_level_scores"].dtype, 
+                                device=mixed.batch["token_level_scores"].device
+                            )
                             mixed.batch["kl_in_loss_scale"] = l_scale
+                            # ----------------------------------------
                         except Exception as _e:
                             print(f"[DCKL] scale preparation failed: {_e}")
 

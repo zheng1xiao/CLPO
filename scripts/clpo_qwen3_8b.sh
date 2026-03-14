@@ -39,9 +39,11 @@ warmup_style=constant
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
 use_kl_loss=true
-kl_loss_coef_hard_scale=0.5
-kl_loss_coef_nonhard_scale=1.0
 kl_loss_coef=0.001
+
+# [KFG] KFG dynamic lambda mechanism hyperparameter
+kfg_gamma=1.0
+
 entropy_coeff=0
 param_offload=false
 optimizer_offload=false
@@ -118,8 +120,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${ppo_micro_batch_size_per_gpu}" \
   actor_rollout_ref.actor.use_kl_loss="${use_kl_loss}" \
   actor_rollout_ref.actor.kl_loss_coef="${kl_loss_coef}" \
-  actor_rollout_ref.actor.kl_loss_coef_hard_scale="${kl_loss_coef_hard_scale}" \
-  actor_rollout_ref.actor.kl_loss_coef_nonhard_scale="${kl_loss_coef_nonhard_scale}" \
+  actor_rollout_ref.actor.kfg_gamma="${kfg_gamma}" \
   actor_rollout_ref.actor.entropy_coeff="${entropy_coeff}" \
   actor_rollout_ref.actor.fsdp_config.param_offload="${param_offload}" \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload="${optimizer_offload}" \
