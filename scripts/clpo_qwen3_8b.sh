@@ -42,6 +42,7 @@ use_kl_loss=true
 kl_loss_coef=0.001
 
 # [KFG] KFG dynamic lambda mechanism hyperparameter
+use_dynamic_kl=true
 kfg_gamma=1.0
 
 entropy_coeff=0
@@ -120,6 +121,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${ppo_micro_batch_size_per_gpu}" \
   actor_rollout_ref.actor.use_kl_loss="${use_kl_loss}" \
   actor_rollout_ref.actor.kl_loss_coef="${kl_loss_coef}" \
+  actor_rollout_ref.actor.use_dynamic_kl="${use_dynamic_kl}" \
   actor_rollout_ref.actor.kfg_gamma="${kfg_gamma}" \
   actor_rollout_ref.actor.entropy_coeff="${entropy_coeff}" \
   actor_rollout_ref.actor.fsdp_config.param_offload="${param_offload}" \

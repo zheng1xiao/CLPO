@@ -78,6 +78,13 @@ tis_imp_ratio_cap: -1
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 
+# Whether to enable Knowledge-Flow-Guided dynamic KL scaling (KFG).
+# When true, per-sample dynamic lambda (based on delta accuracy) is applied; otherwise lambda=1.0.
+use_dynamic_kl: false
+
+# Gamma hyperparameter for KFG dynamic lambda: lambda = exp(-gamma * max(0, delta_acc)).
+kfg_gamma: 1.0
+
 # Whether to use torch.compile()
 # oc.select: the default val for ref.use_torch_compile
 use_torch_compile: true

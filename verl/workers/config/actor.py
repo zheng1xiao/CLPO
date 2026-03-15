@@ -107,6 +107,11 @@ class ActorConfig(BaseConfig):
     entropy_coeff: float = 0
     tis_imp_ratio_cap: float = -1
     use_kl_loss: bool = False
+    # Whether to enable Knowledge-Flow-Guided dynamic KL scaling (KFG).
+    # When true, per-sample dynamic lambda (based on delta accuracy) is applied; otherwise lambda=1.0.
+    use_dynamic_kl: bool = False
+    # Gamma hyperparameter for KFG dynamic lambda: lambda = exp(-gamma * max(0, delta_acc)).
+    kfg_gamma: float = 1.0
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"

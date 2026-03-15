@@ -2705,28 +2705,34 @@ class RayCLPOTrainer(RayPPOTrainer):
                             mixed.non_tensor_batch["difficulty_source"] = np.array(difficulty_labels, dtype=object)
                             
                             # --- [KFG] KFG Dynamic Lambda Mechanism ---
-                            gamma_val = float(self.config.actor_rollout_ref.actor.get("kfg_gamma", 1.0))
+                            use_dynamic_kl = getattr(self.config.actor_rollout_ref.actor, "use_dynamic_kl", False)
                             
-                            delta_acc_list = []
-                            for i, u in enumerate(uid):
-                                source = str(src[i])
-                                if source == "oqa":
-                                    # 原始样本保留严格的KL散度惩罚 (即 delta_acc = 0 -> lambda = 1.0)
-                                    delta_acc_list.append(0.0)
-                                else:
-                                    # 重写样本才计算增益: Acc_Rewritten - Acc_Original
-                                    acc_orig = uid2acc.get(u, 0.0)
-                                    acc_rew = mixed_rewritten_uid2acc.get(u, acc_orig)
-                                    delta_acc_list.append(float(acc_rew - acc_orig))
+                            if use_dynamic_kl:
+                                gamma_val = float(self.config.actor_rollout_ref.actor.get("kfg_gamma", 1.0))
+                                
+                                delta_acc_list = []
+                                for i, u in enumerate(uid):
+                                    source = str(src[i])
+                                    if source == "oqa":
+                                        # 原始样本保留严格的KL散度惩罚 (即 delta_acc = 0 -> lambda = 1.0)
+                                        delta_acc_list.append(0.0)
+                                    else:
+                                        # 重写样本才计算增益: Acc_Rewritten - Acc_Original
+                                        acc_orig = uid2acc.get(u, 0.0)
+                                        acc_rew = mixed_rewritten_uid2acc.get(u, acc_orig)
+                                        delta_acc_list.append(float(acc_rew - acc_orig))
 
-                            delta_acc = torch.tensor(delta_acc_list, dtype=torch.float32)
-                            
-                            # Ensure lambda is 1.0 when Delta Acc <= 0 (no gain or loss -> strict KL)
-                            # i.e. we only decay lambda if there is improvement (delta_acc > 0)
-                            positive_delta = torch.maximum(delta_acc, torch.zeros_like(delta_acc))
-                            
-                            # Calculate dynamic lambda: exp(-gamma * max(0, delta_acc))
-                            dynamic_lambda = torch.exp(-gamma_val * positive_delta)
+                                delta_acc = torch.tensor(delta_acc_list, dtype=torch.float32)
+                                
+                                # Ensure lambda is 1.0 when Delta Acc <= 0 (no gain or loss -> strict KL)
+                                # i.e. we only decay lambda if there is improvement (delta_acc > 0)
+                                positive_delta = torch.maximum(delta_acc, torch.zeros_like(delta_acc))
+                                
+                                # Calculate dynamic lambda: exp(-gamma * max(0, delta_acc))
+                                dynamic_lambda = torch.exp(-gamma_val * positive_delta)
+                            else:
+                                # When dynamic KL is disabled, use uniform lambda=1.0 for all samples
+                                dynamic_lambda = torch.ones(len(uid), dtype=torch.float32)
                             
                             # Apply KFG dynamic lambda to in-reward multipliers
                             r_scale = dynamic_lambda.cpu().numpy().astype(float)
