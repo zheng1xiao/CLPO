@@ -1856,15 +1856,14 @@ class RayCLPOTrainer(RayPPOTrainer):
         }
         return DataProto.from_single_dict(gen_dict)
 
-    def _generate_rewritten_questions(self, rewrite_prompts: list[str], original_batch: DataProto, original_idxs: list[int]) -> tuple[list[str], DataProto]:
+    def _generate_rewritten_questions(self, rewrite_prompts: list[str], original_batch: DataProto, original_idxs: list[int]) -> tuple[list[str], DataProto, DataProto]:
         """Generate ONE rewritten question per original question using the rewrite prompts"""
         if not rewrite_prompts:
-            return [], None
-            
+            return [], None, None
+
         prompt_batch = self._build_prompt_batch(rewrite_prompts)
         if prompt_batch is None:
-            return [], None
-            
+            return [], None, None
         gen_batch = self._get_gen_batch(prompt_batch)
         gen_batch.meta_info["global_steps"] = self.global_steps
         
@@ -1923,7 +1922,7 @@ class RayCLPOTrainer(RayPPOTrainer):
         # If no valid questions extracted, return empty
         if not rewritten_questions:
             print("[ERROR] No valid rewritten questions extracted")
-            return [], None
+            return [], None, None
         
         rewritten_batch_dict = {}
         
@@ -1958,28 +1957,40 @@ class RayCLPOTrainer(RayPPOTrainer):
         
         mapped_original_idxs = [original_idxs[i] for i in valid_indices]
         
+        # FILTER gen_batch_output as well and keep non_tensor_batch properties 
+        rewrite_gen_output = gen_batch_output.select_idxs(valid_indices)
+
         for key, value in original_batch.non_tensor_batch.items():
             # [KFG FIX] We MUST preserve the original UID for KFG calculation
             if isinstance(value, dict):
                 rewritten_dict = {}
+                rewrite_gen_dict = {}
                 for subkey, subvalue in value.items():
                     if isinstance(subvalue, (list, np.ndarray)) and len(subvalue) > 0:
                         selected_values = [subvalue[i] for i in mapped_original_idxs]
                         rewritten_dict[subkey] = np.array(selected_values, dtype=object)
+                        rewrite_gen_dict[subkey] = np.array(selected_values, dtype=object)
                     else:
                         rewritten_dict[subkey] = subvalue
+                        rewrite_gen_dict[subkey] = subvalue
                 rewritten_batch_dict[key] = rewritten_dict
+                rewrite_gen_output.non_tensor_batch[key] = rewrite_gen_dict
             elif isinstance(value, (list, np.ndarray)) and len(value) > 0:
                 selected_values = [value[i] for i in mapped_original_idxs]
                 rewritten_batch_dict[key] = np.array(selected_values, dtype=object)
+                rewrite_gen_output.non_tensor_batch[key] = np.array(selected_values, dtype=object)
             else:
                 rewritten_batch_dict[key] = value
-            
-        rewritten_batch = DataProto.from_single_dict(rewritten_batch_dict)
-        
-        return rewritten_questions, rewritten_batch
+                rewrite_gen_output.non_tensor_batch[key] = value
 
-    def _process_rewritten_batch_like_oqa(self, rewritten_batch: DataProto) -> DataProto:
+        # Force a recognizable prefix for the query generation rollout to avoid matching in GRPO 
+        # (Though n=1 so GRPO just uses 0/1, but safe to keep separate)
+        orig_uids = rewrite_gen_output.non_tensor_batch.get("uid", np.array([str(i) for i in range(len(valid_indices))]))
+        rewrite_gen_output.non_tensor_batch["rewrite_gen_uid"] = np.array([f"rewrite_gen_{u}" for u in orig_uids], dtype=object)
+
+        rewritten_batch = DataProto.from_single_dict(rewritten_batch_dict)
+
+        return rewritten_questions, rewritten_batch, rewrite_gen_output
         
         if rewritten_batch is None or len(rewritten_batch) == 0:
             return None
@@ -2249,9 +2260,11 @@ class RayCLPOTrainer(RayPPOTrainer):
                     med_out = None
                     hard_questions = []
                     med_questions = []
+                    hard_rewrite_gen = None
+                    med_rewrite_gen = None
                     
                     if rewritten_hard_inputs:
-                        hard_questions, hard_batch = self._generate_rewritten_questions(
+                        hard_questions, hard_batch, hard_rewrite_gen = self._generate_rewritten_questions(
                             rewritten_hard_inputs, batch, hard_unique_idxs
                         )
                         if hard_batch is not None:
@@ -2262,7 +2275,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                         print(f"[DEBUG] ❌ none rewritten_hard_inputs")
                     
                     if rewritten_med_inputs:
-                        med_questions, med_batch = self._generate_rewritten_questions(
+                        med_questions, med_batch, med_rewrite_gen = self._generate_rewritten_questions(
                             rewritten_med_inputs, batch, med_unique_idxs
                         )
                         if med_batch is not None:
@@ -2771,6 +2784,128 @@ class RayCLPOTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        
+                    # ---------------- NEW QUERY GEN LOSS ADDITION ---------------- #
+                    to_mix_rewrite = [x for x in [hard_rewrite_gen, med_rewrite_gen] if x is not None and len(x) > 0]
+                    if to_mix_rewrite:
+                        with marked_timer("adv_rewrite_gen", timing_raw, color="brown"):
+                            rewrite_gen = DataProto.concat(to_mix_rewrite)
+                            
+                            # Give rewriting generation its own log probabilities so we can PPO it!
+                            rewrite_old_lp = self.actor_rollout_wg.compute_log_prob(rewrite_gen)
+                            rewrite_old_lp.batch.pop("entropys", None)
+                            rewrite_gen = rewrite_gen.union(rewrite_old_lp)
+                            if self.use_reference_policy:
+                                rewrite_ref_lp = self.ref_policy_wg.compute_ref_log_prob(rewrite_gen)
+                                rewrite_gen = rewrite_gen.union(rewrite_ref_lp)
+                            
+                            if "response_mask" not in rewrite_gen.batch:
+                                rewrite_gen.batch["response_mask"] = compute_response_mask(rewrite_gen)
+                            
+                            bsz = len(rewrite_gen)
+                            seq_len = rewrite_gen.batch["responses"].shape[1]
+                            rewrite_reward = torch.zeros((bsz, seq_len), dtype=mixed.batch["token_level_scores"].dtype, device=mixed.batch["token_level_scores"].device)
+                            
+                            r_uids = rewrite_gen.non_tensor_batch.get("uid", [])
+                            d_acc_list = []
+                            for i, ru in enumerate(r_uids):
+                                a_orig = uid2acc.get(ru, 0.0)
+                                a_rew = mixed_rewritten_uid2acc.get(ru, a_orig)
+                                d_acc = float(a_rew - a_orig)
+                                d_acc_list.append(d_acc)
+                                mask_i = rewrite_gen.batch["response_mask"][i]
+                                valid_indices = (mask_i == 1).nonzero(as_tuple=True)[0]
+                                if len(valid_indices) > 0:
+                                    last_idx = valid_indices[-1]
+                                    rewrite_reward[i, last_idx] = d_acc
+                            
+                            if d_acc_list:
+                                metrics["clpo/rewrite_gen/reward_mean_delta_acc"] = float(np.mean(d_acc_list))
+                                metrics["clpo/rewrite_gen/reward_positive_ratio"] = sum(1 for d in d_acc_list if d > 0.0) / len(d_acc_list)
+                                metrics["clpo/rewrite_gen/reward_negative_ratio"] = sum(1 for d in d_acc_list if d < 0.0) / len(d_acc_list)
+                            
+                            rewrite_gen.batch["token_level_scores"] = rewrite_reward
+                            rewrite_gen.batch["kl_in_loss_scale"] = torch.ones(bsz, dtype=mixed.batch["kl_in_loss_scale"].dtype, device=mixed.batch["kl_in_loss_scale"].device)
+                            
+                            if self.config.algorithm.use_kl_in_reward:
+                                rewrite_gen, _ = apply_kl_penalty(rewrite_gen, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                            else:
+                                rewrite_gen.batch["token_level_rewards"] = rewrite_gen.batch["token_level_scores"]
+                                
+                            rewrite_gen = compute_advantage(
+                                rewrite_gen,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=1, 
+                                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                                config=self.config.algorithm,
+                            )
+                            
+                            # APPLY 1:5 RATIO FOR REWRITE LOSS
+                            rewrite_gen.batch["advantages"] = rewrite_gen.batch["advantages"] * 0.2
+                            
+                            # 1. Align Tensor Keys Dynamically
+                            all_batch_keys = set(mixed.batch.keys()).union(set(rewrite_gen.batch.keys()))
+                            for k in all_batch_keys:
+                                if k not in rewrite_gen.batch:
+                                    val = mixed.batch[k]
+                                    if val.ndim >= 2:
+                                        dummy_shape = list(val.shape)
+                                        dummy_shape[0] = bsz
+                                        dummy_shape[1] = rewrite_reward.shape[1] if dummy_shape[1] > 0 else 0
+                                        rewrite_gen.batch[k] = torch.zeros(dummy_shape, dtype=val.dtype, device=val.device)
+                                    else:
+                                        rewrite_gen.batch[k] = torch.zeros((bsz,), dtype=val.dtype, device=val.device)
+                                    
+                                    # Specific handling for known value distributions:
+                                    if k == "token_level_rewards":
+                                        rewrite_gen.batch[k] = rewrite_reward.clone()
+                                    elif k == "reward_baselines":
+                                        rewrite_gen.batch[k] = rewrite_reward.sum(dim=-1)
+                                        
+                                elif k not in mixed.batch:
+                                    val = rewrite_gen.batch[k]
+                                    if val.ndim >= 2:
+                                        dummy_shape = list(val.shape)
+                                        dummy_shape[0] = len(mixed)
+                                        dummy_shape[1] = mixed.batch["responses"].shape[1] if dummy_shape[1] > 0 else 0
+                                        mixed.batch[k] = torch.zeros(dummy_shape, dtype=val.dtype, device=val.device)
+                                    else:
+                                        mixed.batch[k] = torch.zeros((len(mixed),), dtype=val.dtype, device=val.device)
+
+                            # 2. Align Non-Tensor Keys Dynamically
+                            for k in mixed.non_tensor_batch.keys():
+                                if k not in rewrite_gen.non_tensor_batch:
+                                    rewrite_gen.non_tensor_batch[k] = np.array([None] * bsz, dtype=object)
+                            for k in rewrite_gen.non_tensor_batch.keys():
+                                if k not in mixed.non_tensor_batch:
+                                    mixed.non_tensor_batch[k] = np.array([None] * len(mixed), dtype=object)
+                            
+                            # 3. Dynamic Padding key-by-key
+                            for k in list(mixed.batch.keys()):
+                                t_m = mixed.batch[k]
+                                t_r = rewrite_gen.batch[k]
+                                if isinstance(t_m, torch.Tensor) and isinstance(t_r, torch.Tensor):
+                                    if t_m.ndim >= 2 and t_r.ndim >= 2:
+                                        s_m = t_m.shape[1]
+                                        s_r = t_r.shape[1]
+                                        pad_val = getattr(self.tokenizer, "pad_token_id", 0) if k in ["responses", "input_ids", "prompts"] else 0
+                                        if s_m > s_r:
+                                            pad_len = s_m - s_r
+                                            if t_r.ndim == 2:
+                                                rewrite_gen.batch[k] = torch.nn.functional.pad(t_r, (0, pad_len), value=pad_val)
+                                            elif t_r.ndim == 3:
+                                                rewrite_gen.batch[k] = torch.nn.functional.pad(t_r, (0, 0, 0, pad_len), value=pad_val)
+                                        elif s_r > s_m:
+                                            pad_len = s_r - s_m
+                                            if t_m.ndim == 2:
+                                                mixed.batch[k] = torch.nn.functional.pad(t_m, (0, pad_len), value=pad_val)
+                                            elif t_m.ndim == 3:
+                                                mixed.batch[k] = torch.nn.functional.pad(t_m, (0, 0, 0, pad_len), value=pad_val)
+                                        
+                            mixed = DataProto.concat([mixed, rewrite_gen])
+                    # ------------------------------------------------------------- #
 
                     # Ensure global_token_num is correctly set for the concatenated mixed batch
                     if "attention_mask" in mixed.batch:
