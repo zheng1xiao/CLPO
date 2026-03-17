@@ -2430,11 +2430,9 @@ class RayCLPOTrainer(RayPPOTrainer):
                         pass
 
                     world_size = self.actor_rollout_wg.world_size
-                    ori_len = len(mixed)
-                    keep_len = ori_len - (ori_len % world_size)
                     
-                    if keep_len <= 0:
-                        print("Batch too small for world_size, skipping iteration")
+                    if len(mixed) <= 0:
+                        print("Batch empty, skipping iteration")
                         progress_bar.update(1)
                         self.global_steps += 1
                         continue
@@ -2461,7 +2459,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                     idxs_all = list(range(len(mixed)))
                     hard_first = [i for i in idxs_all if i in hard_tag]
                     others = [i for i in idxs_all if i not in hard_tag]
-                    keep_indices = (hard_first + others)[:keep_len]
+                    keep_indices = hard_first + others
                     mixed = mixed.select_idxs(keep_indices)
 
                     total_sample_count = len(mixed)
@@ -2640,7 +2638,10 @@ class RayCLPOTrainer(RayPPOTrainer):
                     )
 
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(mixed)
+                        mixed_padded, pad_size_m = pad_dataproto_to_divisor(mixed, world_size)
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(mixed_padded)
+                        old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size_m)
+                        
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = mixed.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -2658,14 +2659,16 @@ class RayCLPOTrainer(RayPPOTrainer):
                     if self.use_reference_policy:
                         with marked_timer("ref", timing_raw, color="olive"):
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(mixed)
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(mixed_padded)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(mixed)
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(mixed_padded)
+                            ref_log_prob = unpad_dataproto(ref_log_prob, pad_size=pad_size_m)
                             mixed = mixed.union(ref_log_prob)
 
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(mixed)
+                            values = self.critic_wg.compute_values(mixed_padded)
+                            values = unpad_dataproto(values, pad_size=pad_size_m)
                             mixed = mixed.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
@@ -2815,24 +2818,32 @@ class RayCLPOTrainer(RayPPOTrainer):
                         with marked_timer("adv_rewrite_gen", timing_raw, color="brown"):
                             rewrite_gen = DataProto.concat(to_mix_rewrite)
                             
-                            # Give rewriting generation its own log probabilities so we can PPO it!
-                            rewrite_old_lp = self.actor_rollout_wg.compute_log_prob(rewrite_gen)
-                            rewrite_old_lp.batch.pop("entropys", None)
-                            rewrite_gen = rewrite_gen.union(rewrite_old_lp)
-                            if self.use_reference_policy:
-                                rewrite_ref_lp = self.ref_policy_wg.compute_ref_log_prob(rewrite_gen)
-                                rewrite_gen = rewrite_gen.union(rewrite_ref_lp)
+                            r_world_size = self.actor_rollout_wg.world_size
                             
-                            if "response_mask" not in rewrite_gen.batch:
-                                rewrite_gen.batch["response_mask"] = compute_response_mask(rewrite_gen)
-                            
-                            bsz = len(rewrite_gen)
-                            seq_len = rewrite_gen.batch["responses"].shape[1]
-                            rewrite_reward = torch.zeros((bsz, seq_len), dtype=mixed.batch["token_level_scores"].dtype, device=mixed.batch["token_level_scores"].device)
-                            
-                            r_uids = rewrite_gen.non_tensor_batch.get("uid", [])
-                            is_valid_rewrite = rewrite_gen.non_tensor_batch.get("is_valid_rewrite", np.array([True] * bsz, dtype=bool))
-                            d_acc_list = []
+                            if len(rewrite_gen) > 0:
+                                rewrite_padded, r_pad_size = pad_dataproto_to_divisor(rewrite_gen, r_world_size)
+
+                                # Give rewriting generation its own log probabilities so we can PPO it!
+                                rewrite_old_lp = self.actor_rollout_wg.compute_log_prob(rewrite_padded)
+                                rewrite_old_lp = unpad_dataproto(rewrite_old_lp, pad_size=r_pad_size)
+                                rewrite_old_lp.batch.pop("entropys", None)
+                                rewrite_gen = rewrite_gen.union(rewrite_old_lp)
+                                
+                                if self.use_reference_policy:
+                                    rewrite_ref_lp = self.ref_policy_wg.compute_ref_log_prob(rewrite_padded)
+                                    rewrite_ref_lp = unpad_dataproto(rewrite_ref_lp, pad_size=r_pad_size)
+                                    rewrite_gen = rewrite_gen.union(rewrite_ref_lp)
+                                
+                                if "response_mask" not in rewrite_gen.batch:
+                                    rewrite_gen.batch["response_mask"] = compute_response_mask(rewrite_gen)
+                                
+                                bsz = len(rewrite_gen)
+                                seq_len = rewrite_gen.batch["responses"].shape[1]
+                                rewrite_reward = torch.zeros((bsz, seq_len), dtype=mixed.batch["token_level_scores"].dtype, device=mixed.batch["token_level_scores"].device)
+                                
+                                r_uids = rewrite_gen.non_tensor_batch.get("uid", [])
+                                is_valid_rewrite = rewrite_gen.non_tensor_batch.get("is_valid_rewrite", np.array([True] * bsz, dtype=bool))
+                                d_acc_list = []
                             
                             for i, ru in enumerate(r_uids):
                                 if not is_valid_rewrite[i]:
