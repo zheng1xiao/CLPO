@@ -1890,6 +1890,7 @@ class RayCLPOTrainer(RayPPOTrainer):
         
         rewritten_questions = []
         valid_indices = []
+        is_valid_list = []
         
         for idx, response in enumerate(raw_rewritten_responses):
             try:
@@ -1910,19 +1911,45 @@ class RayCLPOTrainer(RayPPOTrainer):
                 if len(extracted_question) > 10 and len(extracted_question) < 2000:  # reasonable length
                     rewritten_questions.append(extracted_question)
                     valid_indices.append(idx)
+                    is_valid_list.append(True)
                 else:
                     print(f"[WARNING] Extracted question too short/long ({len(extracted_question)} chars), skipping")
+                    is_valid_list.append(False)
                     
             except Exception as e:
                 print(f"[ERROR] Failed to extract rewritten question from response {idx}: {e}")
+                is_valid_list.append(False)
                 continue
         
         print(f"[DEBUG] Successfully extracted {len(rewritten_questions)}/{len(raw_rewritten_responses)} rewritten questions")
         
-        # If no valid questions extracted, return empty
+        # We always keep all generated sequences for actor capability loss calculation.
+        rewrite_gen_output = gen_batch_output # Do not filter
+        rewrite_gen_output.non_tensor_batch["is_valid_rewrite"] = np.array(is_valid_list, dtype=bool)
+
+        # If no valid questions extracted, we return empty rewritten questions and None for rewritten_batch
+        # but WE MUST return rewrite_gen_output so invalid ones get penalized
         if not rewritten_questions:
             print("[ERROR] No valid rewritten questions extracted")
-            return [], None, None
+            
+            for key, value in original_batch.non_tensor_batch.items():
+                if isinstance(value, dict):
+                    rewrite_gen_dict = {}
+                    for subkey, subvalue in value.items():
+                        if isinstance(subvalue, (list, np.ndarray)) and len(subvalue) > 0:
+                            rewrite_gen_dict[subkey] = np.array([subvalue[i] for i in original_idxs], dtype=object)
+                        else:
+                            rewrite_gen_dict[subkey] = subvalue
+                    rewrite_gen_output.non_tensor_batch[key] = rewrite_gen_dict
+                elif isinstance(value, (list, np.ndarray)) and len(value) > 0:
+                    rewrite_gen_output.non_tensor_batch[key] = np.array([value[i] for i in original_idxs], dtype=object)
+                else:
+                    rewrite_gen_output.non_tensor_batch[key] = value
+
+            orig_uids = rewrite_gen_output.non_tensor_batch.get("uid", np.array([str(i) for i in range(len(original_idxs))]))
+            rewrite_gen_output.non_tensor_batch["rewrite_gen_uid"] = np.array([f"rewrite_gen_{u}" for u in orig_uids], dtype=object)
+
+            return [], None, rewrite_gen_output
         
         rewritten_batch_dict = {}
         
@@ -1956,9 +1983,6 @@ class RayCLPOTrainer(RayPPOTrainer):
         rewritten_batch_dict["position_ids"] = position_ids
         
         mapped_original_idxs = [original_idxs[i] for i in valid_indices]
-        
-        # FILTER gen_batch_output as well and keep non_tensor_batch properties 
-        rewrite_gen_output = gen_batch_output.select_idxs(valid_indices)
 
         for key, value in original_batch.non_tensor_batch.items():
             # [KFG FIX] We MUST preserve the original UID for KFG calculation
@@ -1969,7 +1993,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                     if isinstance(subvalue, (list, np.ndarray)) and len(subvalue) > 0:
                         selected_values = [subvalue[i] for i in mapped_original_idxs]
                         rewritten_dict[subkey] = np.array(selected_values, dtype=object)
-                        rewrite_gen_dict[subkey] = np.array(selected_values, dtype=object)
+                        rewrite_gen_dict[subkey] = np.array([subvalue[i] for i in original_idxs], dtype=object)
                     else:
                         rewritten_dict[subkey] = subvalue
                         rewrite_gen_dict[subkey] = subvalue
@@ -1978,14 +2002,14 @@ class RayCLPOTrainer(RayPPOTrainer):
             elif isinstance(value, (list, np.ndarray)) and len(value) > 0:
                 selected_values = [value[i] for i in mapped_original_idxs]
                 rewritten_batch_dict[key] = np.array(selected_values, dtype=object)
-                rewrite_gen_output.non_tensor_batch[key] = np.array(selected_values, dtype=object)
+                rewrite_gen_output.non_tensor_batch[key] = np.array([value[i] for i in original_idxs], dtype=object)
             else:
                 rewritten_batch_dict[key] = value
                 rewrite_gen_output.non_tensor_batch[key] = value
 
         # Force a recognizable prefix for the query generation rollout to avoid matching in GRPO 
         # (Though n=1 so GRPO just uses 0/1, but safe to keep separate)
-        orig_uids = rewrite_gen_output.non_tensor_batch.get("uid", np.array([str(i) for i in range(len(valid_indices))]))
+        orig_uids = rewrite_gen_output.non_tensor_batch.get("uid", np.array([str(i) for i in range(len(original_idxs))]))
         rewrite_gen_output.non_tensor_batch["rewrite_gen_uid"] = np.array([f"rewrite_gen_{u}" for u in orig_uids], dtype=object)
 
         rewritten_batch = DataProto.from_single_dict(rewritten_batch_dict)
@@ -2807,11 +2831,17 @@ class RayCLPOTrainer(RayPPOTrainer):
                             rewrite_reward = torch.zeros((bsz, seq_len), dtype=mixed.batch["token_level_scores"].dtype, device=mixed.batch["token_level_scores"].device)
                             
                             r_uids = rewrite_gen.non_tensor_batch.get("uid", [])
+                            is_valid_rewrite = rewrite_gen.non_tensor_batch.get("is_valid_rewrite", np.array([True] * bsz, dtype=bool))
                             d_acc_list = []
+                            
                             for i, ru in enumerate(r_uids):
-                                a_orig = uid2acc.get(ru, 0.0)
-                                a_rew = mixed_rewritten_uid2acc.get(ru, a_orig)
-                                d_acc = float(a_rew - a_orig)
+                                if not is_valid_rewrite[i]:
+                                    d_acc = -1.0
+                                else:
+                                    a_orig = uid2acc.get(ru, 0.0)
+                                    a_rew = mixed_rewritten_uid2acc.get(ru, a_orig)
+                                    d_acc = float(a_rew - a_orig)
+                                
                                 d_acc_list.append(d_acc)
                                 mask_i = rewrite_gen.batch["response_mask"][i]
                                 valid_indices = (mask_i == 1).nonzero(as_tuple=True)[0]
