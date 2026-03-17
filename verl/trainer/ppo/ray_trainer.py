@@ -1991,7 +1991,8 @@ class RayCLPOTrainer(RayPPOTrainer):
         rewritten_batch = DataProto.from_single_dict(rewritten_batch_dict)
 
         return rewritten_questions, rewritten_batch, rewrite_gen_output
-        
+
+    def _process_rewritten_batch_like_oqa(self, rewritten_batch: DataProto) -> DataProto:
         if rewritten_batch is None or len(rewritten_batch) == 0:
             return None
             
@@ -2013,7 +2014,6 @@ class RayCLPOTrainer(RayPPOTrainer):
             else self.config.actor_rollout_ref.rollout.agent.num_workers
         )
         gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, dp_size)
-        
         
         if not getattr(self, "async_rollout_mode", False):
             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
@@ -2906,6 +2906,15 @@ class RayCLPOTrainer(RayPPOTrainer):
                                         
                             mixed = DataProto.concat([mixed, rewrite_gen])
                     # ------------------------------------------------------------- #
+                    
+                    # Ensure the final mixed batch size is divisible by world_size to prevent NCCL timeout
+                    world_size = self.actor_rollout_wg.world_size
+                    final_len = len(mixed)
+                    keep_len_final = final_len - (final_len % world_size)
+                    
+                    if keep_len_final < final_len:
+                        print(f"[CLPO DEBUG] Truncating final mixed batch from {final_len} to {keep_len_final} to fit world_size {world_size}")
+                        mixed = mixed.select_idxs(list(range(keep_len_final)))
 
                     # Ensure global_token_num is correctly set for the concatenated mixed batch
                     if "attention_mask" in mixed.batch:
