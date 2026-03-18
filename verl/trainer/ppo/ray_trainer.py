@@ -1648,13 +1648,11 @@ class RayCLPOTrainer(RayPPOTrainer):
             "CRITICAL RULES FOR OUTPUT:\n"
             "- OUTPUT MUST BE A SINGLE CODE BLOCK using the exact format provided below:\n"
             "```text\n"
-            "user\n"
             "Solve the following problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
             "[Rewritten question here]\n\n"
             "Remember to put your answer on its own line after \"Answer:\".\n"
-            "assistant\n"
             "```\n"
-            "- Output NOTHING outside the code block.\n"
+            "- Output NOTHING outside the code block. DO NOT include \"user\" or \"assistant\" role markers.\n"
             "- Do NOT include any reasoning, parsing, or explanation of the problem (e.g., avoid phrases like \"Let me simplify this question\" or \"This problem can be rewritten as...\").\n"
             "- Rewrite the question to make it SIMPLER and CLEARER for the reader, while preserving the EXACT task, content, and structure.\n"
             "- Keep the rewritten question STRICTLY UNDER 400 tokens, including all characters, symbols, and spaces.\n"
@@ -1667,18 +1665,14 @@ class RayCLPOTrainer(RayPPOTrainer):
             "3) Include IMPLICIT constraints explicitly if they improve clarity (e.g., implicit preconditions or boundary conditions).\n"
             "4) DO NOT add any background information, new context, or reasoning unrelated to the question.\n\n"
             "ONE-SHOT EXAMPLE (STRICT FORMAT ONLY):\n\n"
-            "Original question (with role markers):\n"
-            "user\n"
+            "Original question:\n"
             "Compute the value of 2 + 3. The last line of your response should be of the form Answer: $Answer.\n\n"
-            "Remember to put your answer on its own line after \"Answer:\".\n"
-            "assistant\n\n"
+            "Remember to put your answer on its own line after \"Answer:\".\n\n"
             "Your output:\n"
             "```text\n"
-            "user\n"
             "Solve the following problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
             "What is the sum of 2 and 3?\n\n"
             "Remember to put your answer on its own line after \"Answer:\".\n"
-            "assistant\n"
             "```\n\n"
             "ORIGINAL_QUESTION (to rewrite):\n"
             "{Q}\n"
@@ -1688,13 +1682,11 @@ class RayCLPOTrainer(RayPPOTrainer):
             "CRITICAL RULES FOR OUTPUT:\n"
             "- OUTPUT MUST BE A SINGLE CODE BLOCK using the exact format provided below:\n"
             "```text\n"
-            "user\n"
             "Solve the following problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
             "[Rewritten question here]\n\n"
             "Remember to put your answer on its own line after \"Answer:\".\n"
-            "assistant\n"
             "```\n"
-            "- Output NOTHING outside the code block.\n"
+            "- Output NOTHING outside the code block. DO NOT include \"user\" or \"assistant\" role markers.\n"
             "- Rewrite the question to DIVERSIFY its expression but PRESERVE its exact meaning and constraints.\n"
             "- Keep the rewritten question STRICTLY UNDER 400 tokens, including all characters, symbols, and spaces.\n"
             "- DO NOT change any domain-specific content (concepts, logic, constraints, solution method, etc.).\n"
@@ -1710,18 +1702,14 @@ class RayCLPOTrainer(RayPPOTrainer):
             "   * Original: 'Determine the area of the rectangle.' ➡ 'Find the rectangular region's area.'\n"
             "4) DO NOT add or remove constraints, context, or instructions.\n\n"
             "ONE-SHOT EXAMPLE (STRICT FORMAT ONLY):\n\n"
-            "Original question (with role markers):\n"
-            "user\n"
+            "Original question:\n"
             "Compute the value of 2 + 3. The last line of your response should be of the form Answer: $Answer.\n\n"
-            "Remember to put your answer on its own line after \"Answer:\".\n"
-            "assistant\n\n"
+            "Remember to put your answer on its own line after \"Answer:\".\n\n"
             "Your output:\n"
             "```text\n"
-            "user\n"
             "Solve the following problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
             "Determine the result of adding 2 and 3.\n\n"
             "Remember to put your answer on its own line after \"Answer:\".\n"
-            "assistant\n"
             "```\n\n"
             "ORIGINAL_QUESTION (to rewrite):\n"
             "{Q}\n"
@@ -1927,11 +1915,19 @@ class RayCLPOTrainer(RayPPOTrainer):
         
         rewritten_batch_dict = {}
         
-        # Use rewritten questions as new prompts (convert to numpy array)
-        rewritten_batch_dict["prompts"] = np.array(rewritten_questions, dtype=object)
+        # Apply chat template to extracted questions to prevent hallucination loops
+        # and match the format of original requests
+        formatted_rewritten_questions = []
+        for q in rewritten_questions:
+            chat = [{"role": "user", "content": q}]
+            formatted_q = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+            formatted_rewritten_questions.append(formatted_q)
+        
+        # Use formatted rewritten questions as new prompts (convert to numpy array)
+        rewritten_batch_dict["prompts"] = np.array(formatted_rewritten_questions, dtype=object)
         
         model_inputs = self.tokenizer(
-            rewritten_questions,  
+            formatted_rewritten_questions,  
             return_tensors="pt",
             add_special_tokens=False,
             padding=True,
