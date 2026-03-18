@@ -1942,9 +1942,6 @@ class RayCLPOTrainer(RayPPOTrainer):
         input_ids = torch.tensor(padded_input_ids, dtype=torch.long)
         attention_mask = torch.tensor(attention_masks, dtype=torch.long)
         
-        # In verl, prompts needs to be input_ids
-        rewritten_batch_dict["prompts"] = input_ids
-        
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1953,6 +1950,9 @@ class RayCLPOTrainer(RayPPOTrainer):
             left_pad=True,
             truncation=self.config.data.get("truncation", "error"),
         )
+        
+        # In verl, prompts needs to be input_ids
+        rewritten_batch_dict["prompts"] = input_ids
         
         position_ids = compute_position_id_with_mask(attention_mask)
         
