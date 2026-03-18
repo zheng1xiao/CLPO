@@ -1808,16 +1808,25 @@ class RayCLPOTrainer(RayPPOTrainer):
         if not rewritten_texts:
             return None
             
-        model_inputs = self.tokenizer(
-            rewritten_texts,
-            return_tensors="pt",
-            add_special_tokens=False,
-            padding=True,
-            truncation=True,
-            max_length=self.max_prompt_length,
-        )
-        input_ids = model_inputs.pop("input_ids")
-        attention_mask = model_inputs.pop("attention_mask")
+        import torch
+        model_inputs = {"input_ids": [], "attention_mask": []}
+        for text in rewritten_texts:
+            chat = [{"role": "user", "content": text}]
+            prompt_ids = self.tokenizer.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)
+            model_inputs["input_ids"].append(torch.tensor(prompt_ids))
+            model_inputs["attention_mask"].append(torch.ones(len(prompt_ids), dtype=torch.long))
+
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            [ids.flip(0) for ids in model_inputs["input_ids"]], 
+            batch_first=True, 
+            padding_value=self.tokenizer.pad_token_id
+        ).flip(1)
+        
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            [mask.flip(0) for mask in model_inputs["attention_mask"]], 
+            batch_first=True, 
+            padding_value=0
+        ).flip(1)
         
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
@@ -1944,24 +1953,35 @@ class RayCLPOTrainer(RayPPOTrainer):
         # Apply chat template to extracted questions to prevent hallucination loops
         # and match the format of original requests
         formatted_rewritten_questions = []
+        import torch
+        model_inputs = {"input_ids": [], "attention_mask": []}
+        
         for q in rewritten_questions:
             chat = [{"role": "user", "content": q}]
+            # We must use tokenize=True to ensure correct special token mapping
+            prompt_ids = self.tokenizer.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)
+            model_inputs["input_ids"].append(torch.tensor(prompt_ids))
+            model_inputs["attention_mask"].append(torch.ones(len(prompt_ids), dtype=torch.long))
+            
+            # They also want the string representation for other operations
             formatted_q = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
             formatted_rewritten_questions.append(formatted_q)
         
         # Use formatted rewritten questions as new prompts (convert to numpy array)
         rewritten_batch_dict["prompts"] = np.array(formatted_rewritten_questions, dtype=object)
         
-        model_inputs = self.tokenizer(
-            formatted_rewritten_questions,  
-            return_tensors="pt",
-            add_special_tokens=False,
-            padding=True,
-            truncation=True,
-            max_length=self.max_prompt_length,
-        )
-        input_ids = model_inputs.pop("input_ids")
-        attention_mask = model_inputs.pop("attention_mask")
+        # Left pad the sequences using pad_token_id
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            [ids.flip(0) for ids in model_inputs["input_ids"]], 
+            batch_first=True, 
+            padding_value=self.tokenizer.pad_token_id
+        ).flip(1)
+        
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            [mask.flip(0) for mask in model_inputs["attention_mask"]], 
+            batch_first=True, 
+            padding_value=0
+        ).flip(1)
         
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
@@ -2120,10 +2140,19 @@ class RayCLPOTrainer(RayPPOTrainer):
 
                 with marked_timer("step", timing_raw):
                     with marked_timer("original_gen", timing_raw, color="red"):
+                        dp_size_main = (
+                            self.actor_rollout_wg.world_size
+                            if not getattr(self, "async_rollout_mode", False)
+                            else self.config.actor_rollout_ref.rollout.agent.num_workers
+                        )
+                        gen_batch_padded, pad_size_main = pad_dataproto_to_divisor(gen_batch, dp_size_main)
+                        
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_padded)
+                        
+                        gen_batch_output = unpad_dataproto(gen_batch_output, pad_size=pad_size_main)
                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -2133,10 +2162,20 @@ class RayCLPOTrainer(RayPPOTrainer):
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
+                            
+                            dp_size_main = (
+                                self.actor_rollout_wg.world_size
+                                if not getattr(self, "async_rollout_mode", False)
+                                else self.config.actor_rollout_ref.rollout.agent.num_workers
+                            )
+                            gen_baseline_padded, pad_size_base = pad_dataproto_to_divisor(gen_baseline_batch, dp_size_main)
+                            
                             if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_padded)
                             else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_padded)
+                                
+                            gen_baseline_output = unpad_dataproto(gen_baseline_output, pad_size=pad_size_base)
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
