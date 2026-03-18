@@ -1915,27 +1915,35 @@ class RayCLPOTrainer(RayPPOTrainer):
         
         rewritten_batch_dict = {}
         
-        # Apply chat template to extracted questions to prevent hallucination loops
-        # and match the format of original requests
-        formatted_rewritten_questions = []
+        import torch
+        
+        # Apply chat template correctly and get token IDs directly to prevent tokenizer fragmentation of special tokens
+        input_ids_list = []
         for q in rewritten_questions:
             chat = [{"role": "user", "content": q}]
-            formatted_q = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-            formatted_rewritten_questions.append(formatted_q)
+            # tokenize=True directly outputs the valid token IDs (151644, etc)
+            prompt_ids = self.tokenizer.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)
+            input_ids_list.append(prompt_ids)
         
-        # Use formatted rewritten questions as new prompts (convert to numpy array)
-        rewritten_batch_dict["prompts"] = np.array(formatted_rewritten_questions, dtype=object)
+        # Pad locally
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+        max_len = max(len(ids) for ids in input_ids_list) if input_ids_list else 0
+        max_len = min(max_len, self.max_prompt_length)
         
-        model_inputs = self.tokenizer(
-            formatted_rewritten_questions,  
-            return_tensors="pt",
-            add_special_tokens=False,
-            padding=True,
-            truncation=True,
-            max_length=self.max_prompt_length,
-        )
-        input_ids = model_inputs.pop("input_ids")
-        attention_mask = model_inputs.pop("attention_mask")
+        padded_input_ids = []
+        attention_masks = []
+        for ids in input_ids_list:
+            if len(ids) > max_len:
+                ids = ids[:max_len]
+            pad_len = max_len - len(ids)
+            padded_input_ids.append([pad_token_id] * pad_len + ids)  # Left pad
+            attention_masks.append([0] * pad_len + [1] * len(ids))
+            
+        input_ids = torch.tensor(padded_input_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_masks, dtype=torch.long)
+        
+        # In verl, prompts needs to be input_ids
+        rewritten_batch_dict["prompts"] = input_ids
         
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
