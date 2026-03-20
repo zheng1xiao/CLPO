@@ -2918,71 +2918,15 @@ class RayCLPOTrainer(RayPPOTrainer):
                                 config=self.config.algorithm,
                             )
                             
-                            # APPLY 1:5 RATIO FOR REWRITE LOSS
-                            rewrite_gen.batch["advantages"] = rewrite_gen.batch["advantages"] * 0.2
+                            # directly set advantage according to d_acc
+                            adv_tensor = torch.zeros_like(rewrite_gen.batch["advantages"])
+                            for i_rw, d_rw in enumerate(d_acc_list):
+                                adv_val = 1.0 if d_rw > 0 else -1.0
+                                adv_tensor[i_rw] = adv_val
+                            rewrite_gen.batch["advantages"] = adv_tensor * rewrite_gen.batch["response_mask"]
                             
-                            # 1. Align Tensor Keys Dynamically
-                            all_batch_keys = set(mixed.batch.keys()).union(set(rewrite_gen.batch.keys()))
-                            for k in all_batch_keys:
-                                if k not in rewrite_gen.batch:
-                                    val = mixed.batch[k]
-                                    if val.ndim >= 2:
-                                        dummy_shape = list(val.shape)
-                                        dummy_shape[0] = bsz
-                                        dummy_shape[1] = rewrite_reward.shape[1] if dummy_shape[1] > 0 else 0
-                                        rewrite_gen.batch[k] = torch.zeros(dummy_shape, dtype=val.dtype, device=val.device)
-                                    else:
-                                        rewrite_gen.batch[k] = torch.zeros((bsz,), dtype=val.dtype, device=val.device)
-                                    
-                                    # Specific handling for known value distributions:
-                                    if k == "token_level_rewards":
-                                        rewrite_gen.batch[k] = rewrite_reward.clone()
-                                    elif k == "reward_baselines":
-                                        rewrite_gen.batch[k] = rewrite_reward.sum(dim=-1)
-                                        
-                                elif k not in mixed.batch:
-                                    val = rewrite_gen.batch[k]
-                                    if val.ndim >= 2:
-                                        dummy_shape = list(val.shape)
-                                        dummy_shape[0] = len(mixed)
-                                        dummy_shape[1] = mixed.batch["responses"].shape[1] if dummy_shape[1] > 0 else 0
-                                        mixed.batch[k] = torch.zeros(dummy_shape, dtype=val.dtype, device=val.device)
-                                    else:
-                                        mixed.batch[k] = torch.zeros((len(mixed),), dtype=val.dtype, device=val.device)
+                            # (Concatenation removed, rewrite_gen and mixed kept separated)
 
-                            # 2. Align Non-Tensor Keys Dynamically
-                            for k in mixed.non_tensor_batch.keys():
-                                if k not in rewrite_gen.non_tensor_batch:
-                                    rewrite_gen.non_tensor_batch[k] = np.array([None] * bsz, dtype=object)
-                            for k in rewrite_gen.non_tensor_batch.keys():
-                                if k not in mixed.non_tensor_batch:
-                                    mixed.non_tensor_batch[k] = np.array([None] * len(mixed), dtype=object)
-                            
-                            # 3. Dynamic Padding key-by-key
-                            for k in list(mixed.batch.keys()):
-                                t_m = mixed.batch[k]
-                                t_r = rewrite_gen.batch[k]
-                                if isinstance(t_m, torch.Tensor) and isinstance(t_r, torch.Tensor):
-                                    if t_m.ndim >= 2 and t_r.ndim >= 2:
-                                        s_m = t_m.shape[1]
-                                        s_r = t_r.shape[1]
-                                        pad_val = getattr(self.tokenizer, "pad_token_id", 0) if k in ["responses", "input_ids", "prompts"] else 0
-                                        if s_m > s_r:
-                                            pad_len = s_m - s_r
-                                            if t_r.ndim == 2:
-                                                rewrite_gen.batch[k] = torch.nn.functional.pad(t_r, (0, pad_len), value=pad_val)
-                                            elif t_r.ndim == 3:
-                                                rewrite_gen.batch[k] = torch.nn.functional.pad(t_r, (0, 0, 0, pad_len), value=pad_val)
-                                        elif s_r > s_m:
-                                            pad_len = s_r - s_m
-                                            if t_m.ndim == 2:
-                                                mixed.batch[k] = torch.nn.functional.pad(t_m, (0, pad_len), value=pad_val)
-                                            elif t_m.ndim == 3:
-                                                mixed.batch[k] = torch.nn.functional.pad(t_m, (0, 0, 0, pad_len), value=pad_val)
-                                        
-                            mixed = DataProto.concat([mixed, rewrite_gen])
-                    # ------------------------------------------------------------- #
-                    
                     # Ensure the final mixed batch size is divisible by world_size to prevent NCCL timeout
                     world_size = self.actor_rollout_wg.world_size
                     final_len = len(mixed)
@@ -3008,6 +2952,29 @@ class RayCLPOTrainer(RayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(mixed)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    # ====== UPDATE FOR REWRITE_GEN ======
+                    if "rewrite_gen" in locals() and rewrite_gen is not None and len(rewrite_gen) > 0:
+                        rw_len = len(rewrite_gen)
+                        keep_len_rw = rw_len - (rw_len % world_size)
+                        if keep_len_rw < rw_len:
+                            rewrite_gen = rewrite_gen.select_idxs(list(range(keep_len_rw)))
+                        
+                        if len(rewrite_gen) > 0:
+                            if "attention_mask" in rewrite_gen.batch:
+                                rewrite_gen.meta_info["global_token_num"] = torch.sum(rewrite_gen.batch["attention_mask"], dim=-1).tolist()
+                                
+                            if self.use_critic:
+                                with marked_timer("update_critic_rewrite", timing_raw, color="pink"):
+                                    critic_output_rw = self.critic_wg.update_critic(rewrite_gen)
+                                    metrics.update({f"rewrite/{k}": v for k, v in reduce_metrics(critic_output_rw.meta_info["metrics"]).items()})
+                                    
+                            if self.config.trainer.critic_warmup <= self.global_steps:
+                                with marked_timer("update_actor_rewrite", timing_raw, color="red"):
+                                    rewrite_gen.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                    actor_output_rw = self.actor_rollout_wg.update_actor(rewrite_gen)
+                                    metrics.update({f"rewrite/{k}": v for k, v in reduce_metrics(actor_output_rw.meta_info["metrics"]).items()})
+                    # ====================================
 
                                         # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
