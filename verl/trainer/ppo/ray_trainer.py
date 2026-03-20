@@ -1808,16 +1808,28 @@ class RayCLPOTrainer(RayPPOTrainer):
         if not rewritten_texts:
             return None
             
-        model_inputs = self.tokenizer(
-            rewritten_texts,
-            return_tensors="pt",
-            add_special_tokens=False,
-            padding=True,
-            truncation=True,
-            max_length=self.max_prompt_length,
-        )
-        input_ids = model_inputs.pop("input_ids")
-        attention_mask = model_inputs.pop("attention_mask")
+        import torch
+        input_ids_list = []
+        for text in rewritten_texts:
+            chat = [{"role": "user", "content": text}]
+            prompt_ids = self.tokenizer.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)
+            input_ids_list.append(prompt_ids)
+            
+        pad_token_id = self.tokenizer.pad_token_id if getattr(self.tokenizer, "pad_token_id", None) is not None else self.tokenizer.eos_token_id
+        max_len = max(len(ids) for ids in input_ids_list) if input_ids_list else 0
+        max_len = min(max_len, getattr(self, "max_prompt_length", 2048))
+        
+        padded_input_ids = []
+        attention_masks = []
+        for ids in input_ids_list:
+            if len(ids) > max_len:
+                ids = ids[:max_len]
+            pad_len = max_len - len(ids)
+            padded_input_ids.append([pad_token_id] * pad_len + ids)  # Left pad
+            attention_masks.append([0] * pad_len + [1] * len(ids))
+            
+        input_ids = torch.tensor(padded_input_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_masks, dtype=torch.long)
         
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
