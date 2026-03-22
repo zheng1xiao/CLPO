@@ -1714,6 +1714,52 @@ class RayCLPOTrainer(RayPPOTrainer):
             "ORIGINAL_QUESTION (to rewrite):\n"
             "{Q}\n"
         )
+        
+        self.rewrite_instr_code_hard = (
+            "You are a master-level code problem rewriting expert. Your mission is TOP-SECRET: rewrite the given programming problem so that it is simpler, clearer, and more direct, while maintaining the EXACT same logic, constraints, input/output structures, and algorithmic difficulty. DO NOT solve the problem or write any code.\n\n"
+            "CRITICAL RULES FOR OUTPUT:\n"
+            "- OUTPUT MUST BE A SINGLE CODE BLOCK using the exact format provided below:\n"
+            "```text\n"
+            "[Rewritten programming problem here]\n"
+            "```\n"
+            "- Output NOTHING outside the code block. DO NOT include \"user\" or \"assistant\" role markers.\n"
+            "- Do NOT include any reasoning, parsing, or explanation of the problem.\n"
+            "- Rewrite the question to make it SIMPLER and CLEARER for the reader, while preserving the EXACT task, content, and structure.\n"
+            "- Remove redundancy and completely clarify definitions, data types, and boundary conditions.\n"
+            "- Keep the rewritten question STRICTLY UNDER 400 tokens, including all characters, symbols, and spaces.\n"
+            "- Preserve ALL formatting or directive rules exactly as in the original question.\n"
+            "- The rewritten problem must be solvable by exactly the same code as the original. DO NOT explicitly, implicitly, or indirectly REVEAL or SUGGEST the solution.\n\n"
+            "HOW TO SIMPLIFY:\n"
+            "1) Eliminate overly verbose context or unnecessary background stories while keeping the core problem statement.\n"
+            "2) Avoid complex clauses by breaking them into shorter, simpler sentences, but do NOT remove or alter necessary constraints or I/O descriptions.\n"
+            "3) Include IMPLICIT constraints explicitly if they improve clarity (e.g., array bounds, variable types).\n"
+            "4) DO NOT add any new context or reasoning unrelated to the problem.\n\n"
+            "ORIGINAL_QUESTION (to rewrite):\n"
+            "{Q}\n"
+        )
+        
+        self.rewrite_instr_code_med = (
+            "You are a master-level code problem rewriting expert. Your mission is TOP-SECRET: rewrite the given programming problem into a diverse but semantically equivalent version, while maintaining the EXACT same logic, constraints, input/output structures, and algorithmic difficulty. DO NOT solve the problem or write any code.\n\n"
+            "CRITICAL RULES FOR OUTPUT:\n"
+            "- OUTPUT MUST BE A SINGLE CODE BLOCK using the exact format provided below:\n"
+            "```text\n"
+            "[Rewritten programming problem here]\n"
+            "```\n"
+            "- Output NOTHING outside the code block. DO NOT include \"user\" or \"assistant\" role markers.\n"
+            "- Rewrite the question to DIVERSIFY its expression but PRESERVE its exact meaning and constraints.\n"
+            "- Keep the rewritten question STRICTLY UNDER 400 tokens, including all characters, symbols, and spaces.\n"
+            "- DO NOT change any core definitions, constraints, or input/output formats.\n"
+            "- Avoid repetitive sentence structures or template-like phrasing by using varied grammar structure, synonyms, or different narrative backdrops (without changing the core logic).\n"
+            "- Preserve ALL formatting or directive rules exactly as in the original question.\n"
+            "- The rewritten problem must be solvable by exactly the same code as the original. DO NOT explicitly, implicitly, or indirectly REVEAL or SUGGEST the solution.\n\n"
+            "HOW TO DIVERSIFY:\n"
+            "1) Rephrase clauses logically (e.g., change phrasing while maintaining the same problem constraints).\n"
+            "2) Rearrange sentence structure without altering the original intent.\n"
+            "3) Use alternative realistic or abstract scenarios to frame the same logical problem, provided they don't break equivalence.\n"
+            "4) DO NOT add or remove core constraints, variable shapes, or limits.\n\n"
+            "ORIGINAL_QUESTION (to rewrite):\n"
+            "{Q}\n"
+        )
 
     def _extract_ground_truth(self, batch: DataProto, idxs: list[int]) -> list[str]:
         """Extract correct answers from batch for specified indices"""
@@ -2246,20 +2292,39 @@ class RayCLPOTrainer(RayPPOTrainer):
 
                     hard_answers = self._extract_ground_truth(batch, hard_unique_idxs) if hard_unique_idxs and should_rewrite_hard else []
                     med_answers = self._extract_ground_truth(batch, med_unique_idxs) if med_unique_idxs and should_rewrite_medium else []
+                    
+                    hard_abilities = [batch.non_tensor_batch["ability"][idx] for idx in hard_unique_idxs] if "ability" in batch.non_tensor_batch and hard_unique_idxs else ["math"] * len(hard_prompts)
+                    med_abilities = [batch.non_tensor_batch["ability"][idx] for idx in med_unique_idxs] if "ability" in batch.non_tensor_batch and med_unique_idxs else ["math"] * len(med_prompts)
 
-                    def apply_rewrite(prompts: list[str], answers: list[str], mode: str) -> list[str]:
+                    def apply_rewrite(prompts: list[str], answers: list[str], abilities: list[str], mode: str) -> list[str]:
                         if not prompts:
                             return []
-                        template = self.rewrite_instr_hard if mode == "hard" else self.rewrite_instr_med
                         
                         if len(answers) != len(prompts):
                             print(f"[WARNING] Mismatch: {len(prompts)} prompts vs {len(answers)} answers")
                             answers = answers[:len(prompts)] if len(answers) > len(prompts) else answers + ["[UNKNOWN]"] * (len(prompts) - len(answers))
+                            
+                        if len(abilities) != len(prompts):
+                            print(f"[WARNING] Mismatch: {len(prompts)} prompts vs {len(abilities)} abilities")
+                            abilities = abilities[:len(prompts)] if len(abilities) > len(prompts) else abilities + ["math"] * (len(prompts) - len(abilities))
                         
-                        return [template.format(Q=p, ANSWER=a) for p, a in zip(prompts, answers)]
+                        results = []
+                        for p, a, ab in zip(prompts, answers, abilities):
+                            ab_lower = str(ab).lower() if ab is not None else "math"
+                            if ab_lower == "code":
+                                template = getattr(self, "rewrite_instr_code_hard", "") if mode == "hard" else getattr(self, "rewrite_instr_code_med", "")
+                                if not template:
+                                    template = self.rewrite_instr_hard if mode == "hard" else self.rewrite_instr_med
+                                    results.append(template.format(Q=p, ANSWER=a))
+                                else:
+                                    results.append(template.format(Q=p))
+                            else:
+                                template = self.rewrite_instr_hard if mode == "hard" else self.rewrite_instr_med
+                                results.append(template.format(Q=p, ANSWER=a))
+                        return results
 
-                    rewritten_hard_inputs = apply_rewrite(hard_prompts, hard_answers, mode="hard") if should_rewrite_hard else []
-                    rewritten_med_inputs = apply_rewrite(med_prompts, med_answers, mode="med") if should_rewrite_medium else []
+                    rewritten_hard_inputs = apply_rewrite(hard_prompts, hard_answers, hard_abilities, mode="hard") if should_rewrite_hard else []
+                    rewritten_med_inputs = apply_rewrite(med_prompts, med_answers, med_abilities, mode="med") if should_rewrite_medium else []
       
                     hard_out = None
                     med_out = None
