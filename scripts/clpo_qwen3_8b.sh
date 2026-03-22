@@ -5,20 +5,20 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3,4,5,6,7"}
 
 
 # Data paths
-train_file="path/to/train.json"
-val_file="path/to/val.json"
+train_file="/mnt/bn/adgrowth-gpu-hl-extend/xiaozheng/CLPO/datasets/dapo-math-17k/dapo-math-17k.parquet"
+val_file="/mnt/bn/adgrowth-gpu-hl-extend/xiaozheng/CLPO/datasets/aime-2024/aime-2024.parquet"
 
 # Model path
-model_path="path/to/model"
+model_path="/mnt/bn/adgrowth-gpu-hl/ckpt/Qwen3-8B"
 
 # Output directory
-output_dir="path/to/output"
+output_dir="/mnt/bn/adgrowth-gpu-hl-extend/xiaozheng/CLPO-loss/CLPO/output-loss/"
 
 # Data configuration
 max_prompt_length=2048
 max_response_length=8192
 train_batch_size=64
-val_batch_size=32
+val_batch_size=64
 truncation="error"
 filter_overlong_prompts=true
 dataloader_num_workers=4
@@ -39,12 +39,9 @@ warmup_style=constant
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
 use_kl_loss=true
-kl_loss_coef=0.001
-
-# [KFG] KFG dynamic lambda mechanism hyperparameter
-use_dynamic_kl=true
 kfg_gamma=1.0
-
+use_dynamic_kl=false
+kl_loss_coef=0.001
 entropy_coeff=0
 param_offload=false
 optimizer_offload=false
@@ -52,7 +49,7 @@ optimizer_offload=false
 # Rollout configuration
 rollout_name=vllm
 n_resp_per_prompt=4
-tensor_model_parallel_size=1
+tensor_model_parallel_size=8
 gpu_memory_utilization=0.5
 log_prob_micro_batch_size_per_gpu=1
 max_model_len=10240
@@ -62,10 +59,12 @@ max_num_batched_tokens=10240
 total_epochs=1
 critic_warmup=0
 test_freq=10
-save_freq=10
+save_freq=50
 val_before_train=true
 ngpus_per_node=${NGPUS_PER_NODE:-8}
 nnodes=${NNODES:-1}
+project_name="clpo-qwen3-8b"
+experiment_name="clpo-qwen3-8b-loss"
 
 # CLPO specific configuration
 clpo_hard_acc_upper=0.3
@@ -74,9 +73,9 @@ clpo_med_acc_upper=0.7
 
 # CLPO rewrite data saving configuration
 clpo_save_rewrite_data=true
-clpo_rewrite_save_path="path/to/rewrite_data.json"
-clpo_hard_rewrite_save_path="path/to/hard_rewrite_data.json"
-clpo_medium_rewrite_save_path="path/to/medium_rewrite_data.json"
+clpo_rewrite_save_path="${output_dir}/rewrite_data.json"
+clpo_hard_rewrite_save_path="${output_dir}/hard_rewrite_data.json"
+clpo_medium_rewrite_save_path="${output_dir}/medium_rewrite_data.json"
 
 echo "Train Data: $train_file"
 echo "Val Data: $val_file"
@@ -133,9 +132,15 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${log_prob_micro_batch_size_per_gpu}" \
   actor_rollout_ref.rollout.max_model_len="${max_model_len}" \
   actor_rollout_ref.rollout.max_num_batched_tokens="${max_num_batched_tokens}" \
+  actor_rollout_ref.rollout.temperature=1.0 \
+  actor_rollout_ref.rollout.top_p=1.0 \
+  actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${log_prob_micro_batch_size_per_gpu}" \
   actor_rollout_ref.ref.fsdp_config.param_offload="${param_offload}" \
-  trainer.logger='["console"]' \
+  trainer.logger='["console", "swanlab"]' \
+  trainer.project_name="${project_name}" \
+  trainer.experiment_name="${experiment_name}" \
   trainer.total_epochs="${total_epochs}" \
   trainer.critic_warmup="${critic_warmup}" \
   trainer.test_freq="${test_freq}" \

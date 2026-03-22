@@ -1714,6 +1714,52 @@ class RayCLPOTrainer(RayPPOTrainer):
             "ORIGINAL_QUESTION (to rewrite):\n"
             "{Q}\n"
         )
+        
+        self.rewrite_instr_code_hard = (
+            "You are a master-level code problem rewriting expert. Your mission is TOP-SECRET: rewrite the given programming problem so that it is simpler, clearer, and more direct, while maintaining the EXACT same logic, constraints, input/output structures, and algorithmic difficulty. DO NOT solve the problem or write any code.\n\n"
+            "CRITICAL RULES FOR OUTPUT:\n"
+            "- OUTPUT MUST BE A SINGLE CODE BLOCK using the exact format provided below:\n"
+            "```text\n"
+            "[Rewritten programming problem here]\n"
+            "```\n"
+            "- Output NOTHING outside the code block. DO NOT include \"user\" or \"assistant\" role markers.\n"
+            "- Do NOT include any reasoning, parsing, or explanation of the problem.\n"
+            "- Rewrite the question to make it SIMPLER and CLEARER for the reader, while preserving the EXACT task, content, and structure.\n"
+            "- Remove redundancy and completely clarify definitions, data types, and boundary conditions.\n"
+            "- Keep the rewritten question STRICTLY UNDER 400 tokens, including all characters, symbols, and spaces.\n"
+            "- Preserve ALL formatting or directive rules exactly as in the original question.\n"
+            "- The rewritten problem must be solvable by exactly the same code as the original. DO NOT explicitly, implicitly, or indirectly REVEAL or SUGGEST the solution.\n\n"
+            "HOW TO SIMPLIFY:\n"
+            "1) Eliminate overly verbose context or unnecessary background stories while keeping the core problem statement.\n"
+            "2) Avoid complex clauses by breaking them into shorter, simpler sentences, but do NOT remove or alter necessary constraints or I/O descriptions.\n"
+            "3) Include IMPLICIT constraints explicitly if they improve clarity (e.g., array bounds, variable types).\n"
+            "4) DO NOT add any new context or reasoning unrelated to the problem.\n\n"
+            "ORIGINAL_QUESTION (to rewrite):\n"
+            "{Q}\n"
+        )
+        
+        self.rewrite_instr_code_med = (
+            "You are a master-level code problem rewriting expert. Your mission is TOP-SECRET: rewrite the given programming problem into a diverse but semantically equivalent version, while maintaining the EXACT same logic, constraints, input/output structures, and algorithmic difficulty. DO NOT solve the problem or write any code.\n\n"
+            "CRITICAL RULES FOR OUTPUT:\n"
+            "- OUTPUT MUST BE A SINGLE CODE BLOCK using the exact format provided below:\n"
+            "```text\n"
+            "[Rewritten programming problem here]\n"
+            "```\n"
+            "- Output NOTHING outside the code block. DO NOT include \"user\" or \"assistant\" role markers.\n"
+            "- Rewrite the question to DIVERSIFY its expression but PRESERVE its exact meaning and constraints.\n"
+            "- Keep the rewritten question STRICTLY UNDER 400 tokens, including all characters, symbols, and spaces.\n"
+            "- DO NOT change any core definitions, constraints, or input/output formats.\n"
+            "- Avoid repetitive sentence structures or template-like phrasing by using varied grammar structure, synonyms, or different narrative backdrops (without changing the core logic).\n"
+            "- Preserve ALL formatting or directive rules exactly as in the original question.\n"
+            "- The rewritten problem must be solvable by exactly the same code as the original. DO NOT explicitly, implicitly, or indirectly REVEAL or SUGGEST the solution.\n\n"
+            "HOW TO DIVERSIFY:\n"
+            "1) Rephrase clauses logically (e.g., change phrasing while maintaining the same problem constraints).\n"
+            "2) Rearrange sentence structure without altering the original intent.\n"
+            "3) Use alternative realistic or abstract scenarios to frame the same logical problem, provided they don't break equivalence.\n"
+            "4) DO NOT add or remove core constraints, variable shapes, or limits.\n\n"
+            "ORIGINAL_QUESTION (to rewrite):\n"
+            "{Q}\n"
+        )
 
     def _extract_ground_truth(self, batch: DataProto, idxs: list[int]) -> list[str]:
         """Extract correct answers from batch for specified indices"""
@@ -1809,24 +1855,27 @@ class RayCLPOTrainer(RayPPOTrainer):
             return None
             
         import torch
-        model_inputs = {"input_ids": [], "attention_mask": []}
+        input_ids_list = []
         for text in rewritten_texts:
             chat = [{"role": "user", "content": text}]
             prompt_ids = self.tokenizer.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)
-            model_inputs["input_ids"].append(torch.tensor(prompt_ids))
-            model_inputs["attention_mask"].append(torch.ones(len(prompt_ids), dtype=torch.long))
-
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            [ids.flip(0) for ids in model_inputs["input_ids"]], 
-            batch_first=True, 
-            padding_value=self.tokenizer.pad_token_id
-        ).flip(1)
+            input_ids_list.append(prompt_ids)
+            
+        pad_token_id = self.tokenizer.pad_token_id if getattr(self.tokenizer, "pad_token_id", None) is not None else self.tokenizer.eos_token_id
+        max_len = max(len(ids) for ids in input_ids_list) if input_ids_list else 0
+        max_len = min(max_len, getattr(self, "max_prompt_length", 2048))
         
-        attention_mask = torch.nn.utils.rnn.pad_sequence(
-            [mask.flip(0) for mask in model_inputs["attention_mask"]], 
-            batch_first=True, 
-            padding_value=0
-        ).flip(1)
+        padded_input_ids = []
+        attention_masks = []
+        for ids in input_ids_list:
+            if len(ids) > max_len:
+                ids = ids[:max_len]
+            pad_len = max_len - len(ids)
+            padded_input_ids.append([pad_token_id] * pad_len + ids)  # Left pad
+            attention_masks.append([0] * pad_len + [1] * len(ids))
+            
+        input_ids = torch.tensor(padded_input_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_masks, dtype=torch.long)
         
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
@@ -1853,14 +1902,15 @@ class RayCLPOTrainer(RayPPOTrainer):
         }
         return DataProto.from_single_dict(gen_dict)
 
-    def _generate_rewritten_questions(self, rewrite_prompts: list[str], original_batch: DataProto, original_idxs: list[int]) -> tuple[list[str], DataProto, DataProto]:
+    def _generate_rewritten_questions(self, rewrite_prompts: list[str], original_batch: DataProto, original_idxs: list[int]) -> tuple[list[str], DataProto]:
         """Generate ONE rewritten question per original question using the rewrite prompts"""
         if not rewrite_prompts:
-            return [], None, None
-
+            return [], None
+            
         prompt_batch = self._build_prompt_batch(rewrite_prompts)
         if prompt_batch is None:
-            return [], None, None
+            return [], None
+            
         gen_batch = self._get_gen_batch(prompt_batch)
         gen_batch.meta_info["global_steps"] = self.global_steps
         
@@ -1887,7 +1937,6 @@ class RayCLPOTrainer(RayPPOTrainer):
         
         rewritten_questions = []
         valid_indices = []
-        is_valid_list = []
         
         for idx, response in enumerate(raw_rewritten_responses):
             try:
@@ -1908,80 +1957,48 @@ class RayCLPOTrainer(RayPPOTrainer):
                 if len(extracted_question) > 10 and len(extracted_question) < 2000:  # reasonable length
                     rewritten_questions.append(extracted_question)
                     valid_indices.append(idx)
-                    is_valid_list.append(True)
                 else:
                     print(f"[WARNING] Extracted question too short/long ({len(extracted_question)} chars), skipping")
-                    is_valid_list.append(False)
                     
             except Exception as e:
                 print(f"[ERROR] Failed to extract rewritten question from response {idx}: {e}")
-                is_valid_list.append(False)
                 continue
         
         print(f"[DEBUG] Successfully extracted {len(rewritten_questions)}/{len(raw_rewritten_responses)} rewritten questions")
         
-        # We always keep all generated sequences for actor capability loss calculation.
-        rewrite_gen_output = gen_batch_output # Do not filter
-        rewrite_gen_output.non_tensor_batch["is_valid_rewrite"] = np.array(is_valid_list, dtype=bool)
-
-        # If no valid questions extracted, we return empty rewritten questions and None for rewritten_batch
-        # but WE MUST return rewrite_gen_output so invalid ones get penalized
+        # If no valid questions extracted, return empty
         if not rewritten_questions:
             print("[ERROR] No valid rewritten questions extracted")
-            
-            for key, value in original_batch.non_tensor_batch.items():
-                if isinstance(value, dict):
-                    rewrite_gen_dict = {}
-                    for subkey, subvalue in value.items():
-                        if isinstance(subvalue, (list, np.ndarray)) and len(subvalue) > 0:
-                            rewrite_gen_dict[subkey] = np.array([subvalue[i] for i in original_idxs], dtype=object)
-                        else:
-                            rewrite_gen_dict[subkey] = subvalue
-                    rewrite_gen_output.non_tensor_batch[key] = rewrite_gen_dict
-                elif isinstance(value, (list, np.ndarray)) and len(value) > 0:
-                    rewrite_gen_output.non_tensor_batch[key] = np.array([value[i] for i in original_idxs], dtype=object)
-                else:
-                    rewrite_gen_output.non_tensor_batch[key] = value
-
-            orig_uids = rewrite_gen_output.non_tensor_batch.get("uid", np.array([str(i) for i in range(len(original_idxs))]))
-            rewrite_gen_output.non_tensor_batch["rewrite_gen_uid"] = np.array([f"rewrite_gen_{u}" for u in orig_uids], dtype=object)
-
-            return [], None, rewrite_gen_output
+            return [], None
         
         rewritten_batch_dict = {}
         
-        # Apply chat template to extracted questions to prevent hallucination loops
-        # and match the format of original requests
-        formatted_rewritten_questions = []
         import torch
-        model_inputs = {"input_ids": [], "attention_mask": []}
         
+        # Apply chat template correctly and get token IDs directly to prevent tokenizer fragmentation of special tokens
+        input_ids_list = []
         for q in rewritten_questions:
             chat = [{"role": "user", "content": q}]
-            # We must use tokenize=True to ensure correct special token mapping
+            # tokenize=True directly outputs the valid token IDs (151644, etc)
             prompt_ids = self.tokenizer.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)
-            model_inputs["input_ids"].append(torch.tensor(prompt_ids))
-            model_inputs["attention_mask"].append(torch.ones(len(prompt_ids), dtype=torch.long))
+            input_ids_list.append(prompt_ids)
+        
+        # Pad locally
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+        max_len = max(len(ids) for ids in input_ids_list) if input_ids_list else 0
+        max_len = min(max_len, self.max_prompt_length)
+        
+        padded_input_ids = []
+        attention_masks = []
+        for ids in input_ids_list:
+            if len(ids) > max_len:
+                ids = ids[:max_len]
+            pad_len = max_len - len(ids)
+            padded_input_ids.append([pad_token_id] * pad_len + ids)  # Left pad
+            attention_masks.append([0] * pad_len + [1] * len(ids))
             
-            # They also want the string representation for other operations
-            formatted_q = self.tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-            formatted_rewritten_questions.append(formatted_q)
-        
-        # Use formatted rewritten questions as new prompts (convert to numpy array)
-        rewritten_batch_dict["prompts"] = np.array(formatted_rewritten_questions, dtype=object)
-        
-        # Left pad the sequences using pad_token_id
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            [ids.flip(0) for ids in model_inputs["input_ids"]], 
-            batch_first=True, 
-            padding_value=self.tokenizer.pad_token_id
-        ).flip(1)
-        
-        attention_mask = torch.nn.utils.rnn.pad_sequence(
-            [mask.flip(0) for mask in model_inputs["attention_mask"]], 
-            batch_first=True, 
-            padding_value=0
-        ).flip(1)
+        input_ids = torch.tensor(padded_input_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_masks, dtype=torch.long)
         
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
@@ -1992,6 +2009,9 @@ class RayCLPOTrainer(RayPPOTrainer):
             truncation=self.config.data.get("truncation", "error"),
         )
         
+        # In verl, prompts needs to be input_ids
+        rewritten_batch_dict["prompts"] = input_ids
+        
         position_ids = compute_position_id_with_mask(attention_mask)
         
         rewritten_batch_dict["input_ids"] = input_ids
@@ -1999,40 +2019,30 @@ class RayCLPOTrainer(RayPPOTrainer):
         rewritten_batch_dict["position_ids"] = position_ids
         
         mapped_original_idxs = [original_idxs[i] for i in valid_indices]
-
+        
         for key, value in original_batch.non_tensor_batch.items():
             # [KFG FIX] We MUST preserve the original UID for KFG calculation
             if isinstance(value, dict):
                 rewritten_dict = {}
-                rewrite_gen_dict = {}
                 for subkey, subvalue in value.items():
                     if isinstance(subvalue, (list, np.ndarray)) and len(subvalue) > 0:
                         selected_values = [subvalue[i] for i in mapped_original_idxs]
                         rewritten_dict[subkey] = np.array(selected_values, dtype=object)
-                        rewrite_gen_dict[subkey] = np.array([subvalue[i] for i in original_idxs], dtype=object)
                     else:
                         rewritten_dict[subkey] = subvalue
-                        rewrite_gen_dict[subkey] = subvalue
                 rewritten_batch_dict[key] = rewritten_dict
-                rewrite_gen_output.non_tensor_batch[key] = rewrite_gen_dict
             elif isinstance(value, (list, np.ndarray)) and len(value) > 0:
                 selected_values = [value[i] for i in mapped_original_idxs]
                 rewritten_batch_dict[key] = np.array(selected_values, dtype=object)
-                rewrite_gen_output.non_tensor_batch[key] = np.array([value[i] for i in original_idxs], dtype=object)
             else:
                 rewritten_batch_dict[key] = value
-                rewrite_gen_output.non_tensor_batch[key] = value
-
-        # Force a recognizable prefix for the query generation rollout to avoid matching in GRPO 
-        # (Though n=1 so GRPO just uses 0/1, but safe to keep separate)
-        orig_uids = rewrite_gen_output.non_tensor_batch.get("uid", np.array([str(i) for i in range(len(original_idxs))]))
-        rewrite_gen_output.non_tensor_batch["rewrite_gen_uid"] = np.array([f"rewrite_gen_{u}" for u in orig_uids], dtype=object)
-
+            
         rewritten_batch = DataProto.from_single_dict(rewritten_batch_dict)
-
-        return rewritten_questions, rewritten_batch, rewrite_gen_output
+        
+        return rewritten_questions, rewritten_batch
 
     def _process_rewritten_batch_like_oqa(self, rewritten_batch: DataProto) -> DataProto:
+        
         if rewritten_batch is None or len(rewritten_batch) == 0:
             return None
             
@@ -2054,6 +2064,7 @@ class RayCLPOTrainer(RayPPOTrainer):
             else self.config.actor_rollout_ref.rollout.agent.num_workers
         )
         gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, dp_size)
+        
         
         if not getattr(self, "async_rollout_mode", False):
             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
@@ -2140,19 +2151,10 @@ class RayCLPOTrainer(RayPPOTrainer):
 
                 with marked_timer("step", timing_raw):
                     with marked_timer("original_gen", timing_raw, color="red"):
-                        dp_size_main = (
-                            self.actor_rollout_wg.world_size
-                            if not getattr(self, "async_rollout_mode", False)
-                            else self.config.actor_rollout_ref.rollout.agent.num_workers
-                        )
-                        gen_batch_padded, pad_size_main = pad_dataproto_to_divisor(gen_batch, dp_size_main)
-                        
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_padded)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_padded)
-                        
-                        gen_batch_output = unpad_dataproto(gen_batch_output, pad_size=pad_size_main)
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -2162,20 +2164,10 @@ class RayCLPOTrainer(RayPPOTrainer):
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            
-                            dp_size_main = (
-                                self.actor_rollout_wg.world_size
-                                if not getattr(self, "async_rollout_mode", False)
-                                else self.config.actor_rollout_ref.rollout.agent.num_workers
-                            )
-                            gen_baseline_padded, pad_size_base = pad_dataproto_to_divisor(gen_baseline_batch, dp_size_main)
-                            
                             if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_padded)
+                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_padded)
-                                
-                            gen_baseline_output = unpad_dataproto(gen_baseline_output, pad_size=pad_size_base)
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
@@ -2300,30 +2292,47 @@ class RayCLPOTrainer(RayPPOTrainer):
 
                     hard_answers = self._extract_ground_truth(batch, hard_unique_idxs) if hard_unique_idxs and should_rewrite_hard else []
                     med_answers = self._extract_ground_truth(batch, med_unique_idxs) if med_unique_idxs and should_rewrite_medium else []
+                    
+                    hard_abilities = [batch.non_tensor_batch["ability"][idx] for idx in hard_unique_idxs] if "ability" in batch.non_tensor_batch and hard_unique_idxs else ["math"] * len(hard_prompts)
+                    med_abilities = [batch.non_tensor_batch["ability"][idx] for idx in med_unique_idxs] if "ability" in batch.non_tensor_batch and med_unique_idxs else ["math"] * len(med_prompts)
 
-                    def apply_rewrite(prompts: list[str], answers: list[str], mode: str) -> list[str]:
+                    def apply_rewrite(prompts: list[str], answers: list[str], abilities: list[str], mode: str) -> list[str]:
                         if not prompts:
                             return []
-                        template = self.rewrite_instr_hard if mode == "hard" else self.rewrite_instr_med
                         
                         if len(answers) != len(prompts):
                             print(f"[WARNING] Mismatch: {len(prompts)} prompts vs {len(answers)} answers")
                             answers = answers[:len(prompts)] if len(answers) > len(prompts) else answers + ["[UNKNOWN]"] * (len(prompts) - len(answers))
+                            
+                        if len(abilities) != len(prompts):
+                            print(f"[WARNING] Mismatch: {len(prompts)} prompts vs {len(abilities)} abilities")
+                            abilities = abilities[:len(prompts)] if len(abilities) > len(prompts) else abilities + ["math"] * (len(prompts) - len(abilities))
                         
-                        return [template.format(Q=p, ANSWER=a) for p, a in zip(prompts, answers)]
+                        results = []
+                        for p, a, ab in zip(prompts, answers, abilities):
+                            ab_lower = str(ab).lower() if ab is not None else "math"
+                            if ab_lower == "code":
+                                template = getattr(self, "rewrite_instr_code_hard", "") if mode == "hard" else getattr(self, "rewrite_instr_code_med", "")
+                                if not template:
+                                    template = self.rewrite_instr_hard if mode == "hard" else self.rewrite_instr_med
+                                    results.append(template.format(Q=p, ANSWER=a))
+                                else:
+                                    results.append(template.format(Q=p))
+                            else:
+                                template = self.rewrite_instr_hard if mode == "hard" else self.rewrite_instr_med
+                                results.append(template.format(Q=p, ANSWER=a))
+                        return results
 
-                    rewritten_hard_inputs = apply_rewrite(hard_prompts, hard_answers, mode="hard") if should_rewrite_hard else []
-                    rewritten_med_inputs = apply_rewrite(med_prompts, med_answers, mode="med") if should_rewrite_medium else []
+                    rewritten_hard_inputs = apply_rewrite(hard_prompts, hard_answers, hard_abilities, mode="hard") if should_rewrite_hard else []
+                    rewritten_med_inputs = apply_rewrite(med_prompts, med_answers, med_abilities, mode="med") if should_rewrite_medium else []
       
                     hard_out = None
                     med_out = None
                     hard_questions = []
                     med_questions = []
-                    hard_rewrite_gen = None
-                    med_rewrite_gen = None
                     
                     if rewritten_hard_inputs:
-                        hard_questions, hard_batch, hard_rewrite_gen = self._generate_rewritten_questions(
+                        hard_questions, hard_batch = self._generate_rewritten_questions(
                             rewritten_hard_inputs, batch, hard_unique_idxs
                         )
                         if hard_batch is not None:
@@ -2334,7 +2343,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                         print(f"[DEBUG] ❌ none rewritten_hard_inputs")
                     
                     if rewritten_med_inputs:
-                        med_questions, med_batch, med_rewrite_gen = self._generate_rewritten_questions(
+                        med_questions, med_batch = self._generate_rewritten_questions(
                             rewritten_med_inputs, batch, med_unique_idxs
                         )
                         if med_batch is not None:
@@ -2465,9 +2474,11 @@ class RayCLPOTrainer(RayPPOTrainer):
                         pass
 
                     world_size = self.actor_rollout_wg.world_size
+                    ori_len = len(mixed)
+                    keep_len = ori_len - (ori_len % world_size)
                     
-                    if len(mixed) <= 0:
-                        print("Batch empty, skipping iteration")
+                    if keep_len <= 0:
+                        print("Batch too small for world_size, skipping iteration")
                         progress_bar.update(1)
                         self.global_steps += 1
                         continue
@@ -2494,7 +2505,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                     idxs_all = list(range(len(mixed)))
                     hard_first = [i for i in idxs_all if i in hard_tag]
                     others = [i for i in idxs_all if i not in hard_tag]
-                    keep_indices = hard_first + others
+                    keep_indices = (hard_first + others)[:keep_len]
                     mixed = mixed.select_idxs(keep_indices)
 
                     total_sample_count = len(mixed)
@@ -2673,10 +2684,7 @@ class RayCLPOTrainer(RayPPOTrainer):
                     )
 
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        mixed_padded, pad_size_m = pad_dataproto_to_divisor(mixed, world_size)
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(mixed_padded)
-                        old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size_m)
-                        
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(mixed)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = mixed.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -2694,16 +2702,14 @@ class RayCLPOTrainer(RayPPOTrainer):
                     if self.use_reference_policy:
                         with marked_timer("ref", timing_raw, color="olive"):
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(mixed_padded)
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(mixed)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(mixed_padded)
-                            ref_log_prob = unpad_dataproto(ref_log_prob, pad_size=pad_size_m)
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(mixed)
                             mixed = mixed.union(ref_log_prob)
 
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(mixed_padded)
-                            values = unpad_dataproto(values, pad_size=pad_size_m)
+                            values = self.critic_wg.compute_values(mixed)
                             mixed = mixed.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
@@ -2846,151 +2852,6 @@ class RayCLPOTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                        
-                    # ---------------- NEW QUERY GEN LOSS ADDITION ---------------- #
-                    to_mix_rewrite = [x for x in [hard_rewrite_gen, med_rewrite_gen] if x is not None and len(x) > 0]
-                    if to_mix_rewrite:
-                        with marked_timer("adv_rewrite_gen", timing_raw, color="brown"):
-                            rewrite_gen = DataProto.concat(to_mix_rewrite)
-                            
-                            r_world_size = self.actor_rollout_wg.world_size
-                            
-                            if len(rewrite_gen) > 0:
-                                rewrite_padded, r_pad_size = pad_dataproto_to_divisor(rewrite_gen, r_world_size)
-
-                                # Give rewriting generation its own log probabilities so we can PPO it!
-                                rewrite_old_lp = self.actor_rollout_wg.compute_log_prob(rewrite_padded)
-                                rewrite_old_lp = unpad_dataproto(rewrite_old_lp, pad_size=r_pad_size)
-                                rewrite_old_lp.batch.pop("entropys", None)
-                                rewrite_gen = rewrite_gen.union(rewrite_old_lp)
-                                
-                                if self.use_reference_policy:
-                                    rewrite_ref_lp = self.ref_policy_wg.compute_ref_log_prob(rewrite_padded)
-                                    rewrite_ref_lp = unpad_dataproto(rewrite_ref_lp, pad_size=r_pad_size)
-                                    rewrite_gen = rewrite_gen.union(rewrite_ref_lp)
-                                
-                                if "response_mask" not in rewrite_gen.batch:
-                                    rewrite_gen.batch["response_mask"] = compute_response_mask(rewrite_gen)
-                                
-                                bsz = len(rewrite_gen)
-                                seq_len = rewrite_gen.batch["responses"].shape[1]
-                                rewrite_reward = torch.zeros((bsz, seq_len), dtype=mixed.batch["token_level_scores"].dtype, device=mixed.batch["token_level_scores"].device)
-                                
-                                r_uids = rewrite_gen.non_tensor_batch.get("uid", [])
-                                is_valid_rewrite = rewrite_gen.non_tensor_batch.get("is_valid_rewrite", np.array([True] * bsz, dtype=bool))
-                                d_acc_list = []
-                            
-                            for i, ru in enumerate(r_uids):
-                                if not is_valid_rewrite[i]:
-                                    d_acc = -1.0
-                                else:
-                                    a_orig = uid2acc.get(ru, 0.0)
-                                    a_rew = mixed_rewritten_uid2acc.get(ru, a_orig)
-                                    d_acc = float(a_rew - a_orig)
-                                
-                                d_acc_list.append(d_acc)
-                                mask_i = rewrite_gen.batch["response_mask"][i]
-                                valid_indices = (mask_i == 1).nonzero(as_tuple=True)[0]
-                                if len(valid_indices) > 0:
-                                    last_idx = valid_indices[-1]
-                                    rewrite_reward[i, last_idx] = d_acc
-                            
-                            if d_acc_list:
-                                metrics["clpo/rewrite_gen/reward_mean_delta_acc"] = float(np.mean(d_acc_list))
-                                metrics["clpo/rewrite_gen/reward_positive_ratio"] = sum(1 for d in d_acc_list if d > 0.0) / len(d_acc_list)
-                                metrics["clpo/rewrite_gen/reward_negative_ratio"] = sum(1 for d in d_acc_list if d < 0.0) / len(d_acc_list)
-                            
-                            rewrite_gen.batch["token_level_scores"] = rewrite_reward
-                            rewrite_gen.batch["kl_in_loss_scale"] = torch.ones(bsz, dtype=mixed.batch["kl_in_loss_scale"].dtype, device=mixed.batch["kl_in_loss_scale"].device)
-                            
-                            if self.config.algorithm.use_kl_in_reward:
-                                rewrite_gen, _ = apply_kl_penalty(rewrite_gen, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
-                            else:
-                                rewrite_gen.batch["token_level_rewards"] = rewrite_gen.batch["token_level_scores"]
-                                
-                            rewrite_gen = compute_advantage(
-                                rewrite_gen,
-                                adv_estimator=self.config.algorithm.adv_estimator,
-                                gamma=self.config.algorithm.gamma,
-                                lam=self.config.algorithm.lam,
-                                num_repeat=1, 
-                                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-                                config=self.config.algorithm,
-                            )
-                            
-                            # APPLY 1:5 RATIO FOR REWRITE LOSS
-                            rewrite_gen.batch["advantages"] = rewrite_gen.batch["advantages"] * 0.2
-                            
-                            # 1. Align Tensor Keys Dynamically
-                            all_batch_keys = set(mixed.batch.keys()).union(set(rewrite_gen.batch.keys()))
-                            for k in all_batch_keys:
-                                if k not in rewrite_gen.batch:
-                                    val = mixed.batch[k]
-                                    if val.ndim >= 2:
-                                        dummy_shape = list(val.shape)
-                                        dummy_shape[0] = bsz
-                                        dummy_shape[1] = rewrite_reward.shape[1] if dummy_shape[1] > 0 else 0
-                                        rewrite_gen.batch[k] = torch.zeros(dummy_shape, dtype=val.dtype, device=val.device)
-                                    else:
-                                        rewrite_gen.batch[k] = torch.zeros((bsz,), dtype=val.dtype, device=val.device)
-                                    
-                                    # Specific handling for known value distributions:
-                                    if k == "token_level_rewards":
-                                        rewrite_gen.batch[k] = rewrite_reward.clone()
-                                    elif k == "reward_baselines":
-                                        rewrite_gen.batch[k] = rewrite_reward.sum(dim=-1)
-                                        
-                                elif k not in mixed.batch:
-                                    val = rewrite_gen.batch[k]
-                                    if val.ndim >= 2:
-                                        dummy_shape = list(val.shape)
-                                        dummy_shape[0] = len(mixed)
-                                        dummy_shape[1] = mixed.batch["responses"].shape[1] if dummy_shape[1] > 0 else 0
-                                        mixed.batch[k] = torch.zeros(dummy_shape, dtype=val.dtype, device=val.device)
-                                    else:
-                                        mixed.batch[k] = torch.zeros((len(mixed),), dtype=val.dtype, device=val.device)
-
-                            # 2. Align Non-Tensor Keys Dynamically
-                            for k in mixed.non_tensor_batch.keys():
-                                if k not in rewrite_gen.non_tensor_batch:
-                                    rewrite_gen.non_tensor_batch[k] = np.array([None] * bsz, dtype=object)
-                            for k in rewrite_gen.non_tensor_batch.keys():
-                                if k not in mixed.non_tensor_batch:
-                                    mixed.non_tensor_batch[k] = np.array([None] * len(mixed), dtype=object)
-                            
-                            # 3. Dynamic Padding key-by-key
-                            for k in list(mixed.batch.keys()):
-                                t_m = mixed.batch[k]
-                                t_r = rewrite_gen.batch[k]
-                                if isinstance(t_m, torch.Tensor) and isinstance(t_r, torch.Tensor):
-                                    if t_m.ndim >= 2 and t_r.ndim >= 2:
-                                        s_m = t_m.shape[1]
-                                        s_r = t_r.shape[1]
-                                        pad_val = getattr(self.tokenizer, "pad_token_id", 0) if k in ["responses", "input_ids", "prompts"] else 0
-                                        if s_m > s_r:
-                                            pad_len = s_m - s_r
-                                            if t_r.ndim == 2:
-                                                rewrite_gen.batch[k] = torch.nn.functional.pad(t_r, (0, pad_len), value=pad_val)
-                                            elif t_r.ndim == 3:
-                                                rewrite_gen.batch[k] = torch.nn.functional.pad(t_r, (0, 0, 0, pad_len), value=pad_val)
-                                        elif s_r > s_m:
-                                            pad_len = s_r - s_m
-                                            if t_m.ndim == 2:
-                                                mixed.batch[k] = torch.nn.functional.pad(t_m, (0, pad_len), value=pad_val)
-                                            elif t_m.ndim == 3:
-                                                mixed.batch[k] = torch.nn.functional.pad(t_m, (0, 0, 0, pad_len), value=pad_val)
-                                        
-                            mixed = DataProto.concat([mixed, rewrite_gen])
-                    # ------------------------------------------------------------- #
-                    
-                    # Ensure the final mixed batch size is divisible by world_size to prevent NCCL timeout
-                    world_size = self.actor_rollout_wg.world_size
-                    final_len = len(mixed)
-                    keep_len_final = final_len - (final_len % world_size)
-                    
-                    if keep_len_final < final_len:
-                        print(f"[CLPO DEBUG] Truncating final mixed batch from {final_len} to {keep_len_final} to fit world_size {world_size}")
-                        mixed = mixed.select_idxs(list(range(keep_len_final)))
 
                     # Ensure global_token_num is correctly set for the concatenated mixed batch
                     if "attention_mask" in mixed.batch:
